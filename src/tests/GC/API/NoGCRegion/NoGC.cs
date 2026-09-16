@@ -1,5 +1,7 @@
 using System;
 using System.Runtime;
+using Xunit;
+using TestLibrary;
 
 public class Test
 {
@@ -131,7 +133,11 @@ public class Test
         return isCurrentTestPassed;
     }
 
-    public static int Main()
+    [ActiveIssue("needs triage", typeof(PlatformDetection), nameof(PlatformDetection.IsArmProcess))]
+    [ActiveIssue("needs triage", TestPlatforms.Browser | TestPlatforms.iOS | TestPlatforms.tvOS | TestPlatforms.MacCatalyst)]
+    [SkipOnCoreClr("This test is not compatible with GC stress.", RuntimeTestModes.AnyGCStress)]
+    [Fact]
+    public static int TestEntryPoint()
     {
         arrByteArrayLen = 5000;
         arrByteArray = new byte[arrByteArrayLen][];

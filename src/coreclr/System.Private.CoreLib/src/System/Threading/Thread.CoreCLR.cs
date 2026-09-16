@@ -2,11 +2,13 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Serialization;
 using System.Runtime.Versioning;
+using Microsoft.Win32.SafeHandles;
 
 namespace System.Threading
 {
@@ -33,32 +35,39 @@ namespace System.Threading
         private string? _name;
         private StartHelper? _startHelper;
 
-        /*=========================================================================
-        ** The base implementation of Thread is all native.  The following fields
-        ** should never be used in the C# code.  They are here to define the proper
-        ** space so the thread object may be allocated.  DON'T CHANGE THESE UNLESS
-        ** YOU MODIFY ThreadBaseObject in vm\object.h
-        =========================================================================*/
-#pragma warning disable CA1823, 169 // These fields are not used from managed.
-        // IntPtrs need to be together, and before ints, because IntPtrs are 64-bit
-        // fields on 64-bit platforms, where they will be sorted together.
+#if TARGET_UNIX || TARGET_BROWSER || TARGET_WASI
+        internal WaitSubsystem.ThreadWaitInfo? _waitInfo;
+#endif
 
-        private IntPtr _DONT_USE_InternalThread; // Pointer
-        private int _priority; // INT32
-
-        // The following field is required for interop with the VS Debugger
-        // Prior to making any changes to this field, please reach out to the VS Debugger
-        // team to make sure that your changes are not going to prevent the debugger
-        // from working.
-        private int _managedThreadId; // INT32
-#pragma warning restore CA1823, 169
+        private IntPtr _DONT_USE_InternalThread;
+        private int _priority;
+        private int _managedThreadId; // Debugger depends on the exact name of this field.
 
         // This is used for a quick check on thread pool threads after running a work item to determine if the name, background
         // state, or priority were changed by the work item, and if so to reset it. Other threads may also change some of those,
         // but those types of changes may race with the reset anyway, so this field doesn't need to be synchronized.
         private bool _mayNeedResetForThreadPool;
 
+        // This is set in two places:
+        // For threads started with Thread.Start: Set in managed code as the thread is exiting.
+        // For external threads that attach to the runtime: Set in unmanaged code as part of thread detach.
+        // This is only read in managed code.
+        private bool _isDead;
+        private bool _isThreadPool;
+
         private Thread() { }
+
+        internal static Exception GetQCallSpecialException(nint status)
+        {
+            Exception? exception = null;
+            GetQCallSpecialException(status, ObjectHandleOnStack.Create(ref exception));
+            Debug.Assert(exception is not null);
+            return exception;
+        }
+
+        [ErrorHandler(typeof(QCallExceptionStatusMarshaller), ErrorLocation.HiddenLastParameter)]
+        [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "ThreadNative_GetQCallSpecialException")]
+        private static partial void GetQCallSpecialException(nint status, ObjectHandleOnStack exception);
 
         public int ManagedThreadId
         {
@@ -74,7 +83,7 @@ namespace System.Threading
             // This should never happen under normal circumstances.
             if (thread == IntPtr.Zero)
             {
-                throw new ArgumentException(null, SR.Argument_InvalidHandle);
+                throw new ThreadStateException(SR.Argument_InvalidHandle);
             }
 
             return new ThreadHandle(thread);
@@ -86,37 +95,33 @@ namespace System.Threading
             {
                 fixed (char* pThreadName = _name)
                 {
-                    StartInternal(GetNativeHandle(), _startHelper?._maxStackSize ?? 0, _priority, pThreadName);
+                    Exception? exception = null;
+                    if (StartInternal(GetNativeHandle(), _startHelper?._maxStackSize ?? 0, _priority, _isThreadPool ? Interop.BOOL.TRUE : Interop.BOOL.FALSE, pThreadName, ObjectHandleOnStack.Create(ref exception)) == Interop.BOOL.FALSE)
+                    {
+                        throw new ThreadStartException(exception);
+                    }
                 }
             }
         }
 
+        [ErrorHandler(typeof(QCallExceptionStatusMarshaller), ErrorLocation.HiddenLastParameter)]
         [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "ThreadNative_Start")]
-        private static unsafe partial void StartInternal(ThreadHandle t, int stackSize, int priority, char* pThreadName);
+        private static unsafe partial Interop.BOOL StartInternal(ThreadHandle t, int stackSize, int priority, Interop.BOOL isThreadPool, char* pThreadName, ObjectHandleOnStack exception);
 
-        // Called from the runtime
-        private void StartCallback()
+        [UnmanagedCallersOnly]
+        private static unsafe void StartCallback(Thread* pThread)
         {
-            StartHelper? startHelper = _startHelper;
+            StartHelper? startHelper = pThread->_startHelper;
             Debug.Assert(startHelper != null);
-            _startHelper = null;
+            pThread->_startHelper = null;
 
             startHelper.Run();
+
+            // When this thread is about to exit, inform any subsystems that need to know.
+            // For external threads that have been attached to the runtime, we'll call this
+            // after the thread has been detached as it won't come through this path.
+            pThread->OnThreadExited();
         }
-
-        // Invoked by VM. Helper method to get a logical thread ID for StringBuilder (for
-        // correctness) and for FileStream's async code path (for perf, to avoid creating
-        // a Thread instance).
-        [MethodImpl(MethodImplOptions.InternalCall)]
-        private static extern IntPtr InternalGetCurrentThread();
-
-        /// <summary>
-        /// Suspends the current thread for timeout milliseconds. If timeout == 0,
-        /// forces the thread to give up the remainder of its timeslice.  If timeout
-        /// == Timeout.Infinite, no timeout will occur.
-        /// </summary>
-        [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "ThreadNative_Sleep")]
-        private static partial void SleepInternal(int millisecondsTimeout);
 
         // Max iterations to be done in SpinWait without switching GC modes.
         private const int SpinWaitCoopThreshold = 1024;
@@ -138,6 +143,8 @@ namespace System.Threading
         /// </summary>
         public static void SpinWait(int iterations)
         {
+            if (!RuntimeFeature.IsMultithreadingSupported) return;
+
             if (iterations < SpinWaitCoopThreshold)
             {
                 SpinWaitInternal(iterations);
@@ -148,19 +155,33 @@ namespace System.Threading
             }
         }
 
+        [ErrorHandler(typeof(QCallExceptionStatusMarshaller), ErrorLocation.HiddenLastParameter)]
         [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "ThreadNative_YieldThread")]
         private static partial Interop.BOOL YieldInternal();
 
         public static bool Yield() => YieldInternal() != Interop.BOOL.FALSE;
 
         [MethodImpl(MethodImplOptions.NoInlining)]
-        private static Thread InitializeCurrentThread() => t_currentThread = GetCurrentThreadNative();
+        private static Thread InitializeCurrentThread()
+        {
+            Thread? thread = null;
+            GetCurrentThread(ObjectHandleOnStack.Create(ref thread));
+            return t_currentThread = thread!;
+        }
 
-        [MethodImpl(MethodImplOptions.InternalCall)]
-        private static extern Thread GetCurrentThreadNative();
+        [ErrorHandler(typeof(QCallExceptionStatusMarshaller), ErrorLocation.HiddenLastParameter)]
+        [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "ThreadNative_GetCurrentThread")]
+        private static partial void GetCurrentThread(ObjectHandleOnStack thread);
 
-        [MethodImpl(MethodImplOptions.InternalCall)]
-        private extern void Initialize();
+        private void Initialize()
+        {
+            Thread _this = this;
+            Initialize(ObjectHandleOnStack.Create(ref _this));
+        }
+
+        [ErrorHandler(typeof(QCallExceptionStatusMarshaller), ErrorLocation.HiddenLastParameter)]
+        [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "ThreadNative_Initialize")]
+        private static partial void Initialize(ObjectHandleOnStack thread);
 
         /// <summary>Clean up the thread when it goes away.</summary>
         ~Thread() => InternalFinalize(); // Delegate to the unmanaged portion.
@@ -168,21 +189,18 @@ namespace System.Threading
         [MethodImpl(MethodImplOptions.InternalCall)]
         private extern void InternalFinalize();
 
-        partial void ThreadNameChanged(string? value)
+        private void ThreadNameChanged(string? value)
         {
             InformThreadNameChange(GetNativeHandle(), value, value?.Length ?? 0);
             GC.KeepAlive(this);
         }
 
+        [ErrorHandler(typeof(QCallExceptionStatusMarshaller), ErrorLocation.HiddenLastParameter)]
         [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "ThreadNative_InformThreadNameChange", StringMarshalling = StringMarshalling.Utf16)]
         private static partial void InformThreadNameChange(ThreadHandle t, string? name, int len);
 
         /// <summary>Returns true if the thread has been started and is not dead.</summary>
-        public extern bool IsAlive
-        {
-            [MethodImpl(MethodImplOptions.InternalCall)]
-            get;
-        }
+        public bool IsAlive => (ThreadState & (ThreadState.Unstarted | ThreadState.Stopped | ThreadState.Aborted)) == 0;
 
         /// <summary>
         /// Return whether or not this thread is a background thread.  Background
@@ -190,9 +208,24 @@ namespace System.Threading
         /// </summary>
         public bool IsBackground
         {
-            get => GetIsBackground();
+            get
+            {
+                if (_isDead)
+                {
+                    throw new ThreadStateException(SR.ThreadState_Dead_State);
+                }
+
+                Interop.BOOL res = GetIsBackground(GetNativeHandle());
+                GC.KeepAlive(this);
+                return res != Interop.BOOL.FALSE;
+            }
             set
             {
+                if (_isDead)
+                {
+                    throw new ThreadStateException(SR.ThreadState_Dead_State);
+                }
+
                 SetIsBackground(GetNativeHandle(), value ? Interop.BOOL.TRUE : Interop.BOOL.FALSE);
                 GC.KeepAlive(this);
                 if (!value)
@@ -202,41 +235,64 @@ namespace System.Threading
             }
         }
 
-        [MethodImpl(MethodImplOptions.InternalCall)]
-        private extern bool GetIsBackground();
+        [SuppressGCTransition]
+        [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "ThreadNative_GetIsBackground")]
+        private static partial Interop.BOOL GetIsBackground(ThreadHandle t);
 
+        [ErrorHandler(typeof(QCallExceptionStatusMarshaller), ErrorLocation.HiddenLastParameter)]
         [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "ThreadNative_SetIsBackground")]
         private static partial void SetIsBackground(ThreadHandle t, Interop.BOOL value);
 
         /// <summary>Returns true if the thread is a threadpool thread.</summary>
-        public extern bool IsThreadPoolThread
+        public bool IsThreadPoolThread
         {
-            [MethodImpl(MethodImplOptions.InternalCall)]
-            get;
-            [MethodImpl(MethodImplOptions.InternalCall)]
-            internal set;
+            get
+            {
+                if (_isDead)
+                {
+                    throw new ThreadStateException(SR.ThreadState_Dead_State);
+                }
+
+                return _isThreadPool;
+            }
+            internal set
+            {
+                Debug.Assert(value);
+                Debug.Assert(!_isDead);
+                Debug.Assert(((ThreadState & ThreadState.Unstarted) != 0)
+#if TARGET_WINDOWS
+                    || ThreadPool.UseWindowsThreadPool
+#endif
+                );
+                _isThreadPool = value;
+            }
         }
+
+        [ErrorHandler(typeof(QCallExceptionStatusMarshaller), ErrorLocation.HiddenLastParameter)]
+        [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "ThreadNative_SetPriority")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static partial void SetPriority(ObjectHandleOnStack thread, int priority);
 
         /// <summary>Returns the priority of the thread.</summary>
         public ThreadPriority Priority
         {
-            get => (ThreadPriority)GetPriorityNative();
+            get
+            {
+                if (_isDead)
+                {
+                    throw new ThreadStateException(SR.ThreadState_Dead_Priority);
+                }
+                return (ThreadPriority)_priority;
+            }
             set
             {
-                SetPriorityNative((int)value);
-                if (value != ThreadPriority.Normal)
-                {
-                    _mayNeedResetForThreadPool = true;
-                }
+                Thread _this = this;
+                SetPriority(ObjectHandleOnStack.Create(ref _this), (int)value);
+                _mayNeedResetForThreadPool = true;
             }
         }
 
-        [MethodImpl(MethodImplOptions.InternalCall)]
-        private extern int GetPriorityNative();
-
-        [MethodImpl(MethodImplOptions.InternalCall)]
-        private extern void SetPriorityNative(int priority);
-
+        [ErrorHandler(typeof(QCallExceptionStatusMarshaller), ErrorLocation.HiddenLastParameter)]
         [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "ThreadNative_GetCurrentOSThreadId")]
         private static partial ulong GetCurrentOSThreadId();
 
@@ -244,26 +300,68 @@ namespace System.Threading
         /// Return the thread state as a consistent set of bits.  This is more
         /// general then IsAlive or IsBackground.
         /// </summary>
-        public ThreadState ThreadState => (ThreadState)GetThreadStateNative();
+        public ThreadState ThreadState
+        {
+            get
+            {
+                if (_isDead)
+                {
+                    return ThreadState.Stopped;
+                }
 
-        [MethodImpl(MethodImplOptions.InternalCall)]
-        private extern int GetThreadStateNative();
+                var state = (ThreadState)GetThreadState(GetNativeHandle());
+                GC.KeepAlive(this);
+                return state;
+            }
+        }
 
-        public ApartmentState GetApartmentState() =>
-#if FEATURE_COMINTEROP_APARTMENT_SUPPORT
-            (ApartmentState)GetApartmentStateNative();
-#else // !FEATURE_COMINTEROP_APARTMENT_SUPPORT
-            ApartmentState.Unknown;
-#endif // FEATURE_COMINTEROP_APARTMENT_SUPPORT
+        [SuppressGCTransition]
+        [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "ThreadNative_GetThreadState")]
+        private static partial int GetThreadState(ThreadHandle t);
+
+        internal unsafe void SetWaitSleepJoinState()
+        {
+            // This method is called when the thread is about to enter a wait, sleep, or join state.
+            // It sets the state in the native layer to indicate that the thread is waiting.
+            NativeThread* nativeThread = GetNativeThreadForCurrentThread();
+            Interlocked.Or(ref nativeThread->m_State, NativeThread.ThreadState.TS_WaitSleepJoin);
+        }
+
+        internal unsafe void ClearWaitSleepJoinState()
+        {
+            // This method is called when the thread is no longer in a wait, sleep, or join state.
+            // It clears the state in the native layer to indicate that the thread is no longer waiting.
+            NativeThread* nativeThread = GetNativeThreadForCurrentThread();
+            Interlocked.And(ref nativeThread->m_State, ~NativeThread.ThreadState.TS_WaitSleepJoin);
+        }
 
         /// <summary>
         /// An unstarted thread can be marked to indicate that it will host a
         /// single-threaded or multi-threaded apartment.
         /// </summary>
 #if FEATURE_COMINTEROP_APARTMENT_SUPPORT
+        [ErrorHandler(typeof(QCallExceptionStatusMarshaller), ErrorLocation.HiddenLastParameter)]
+        [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "ThreadNative_GetApartmentState")]
+        private static partial int GetApartmentState(ObjectHandleOnStack t);
+
+        [ErrorHandler(typeof(QCallExceptionStatusMarshaller), ErrorLocation.HiddenLastParameter)]
+        [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "ThreadNative_SetApartmentState")]
+        private static partial int SetApartmentState(ObjectHandleOnStack t, int state);
+
+        public ApartmentState GetApartmentState()
+        {
+            Thread _this = this;
+            return (ApartmentState)GetApartmentState(ObjectHandleOnStack.Create(ref _this));
+        }
+
         private bool SetApartmentStateUnchecked(ApartmentState state, bool throwOnError)
         {
-            ApartmentState retState = (ApartmentState)SetApartmentStateNative((int)state);
+            ApartmentState retState;
+            lock (this) // This lock is only needed when the this is not the current thread.
+            {
+                Thread _this = this;
+                retState = (ApartmentState)SetApartmentState(ObjectHandleOnStack.Create(ref _this), (int)state);
+            }
 
             // Special case where we pass in Unknown and get back MTA.
             //  Once we CoUninitialize the thread, the OS will still
@@ -288,12 +386,12 @@ namespace System.Threading
             return true;
         }
 
-        [MethodImpl(MethodImplOptions.InternalCall)]
-        internal extern int GetApartmentStateNative();
+        internal static bool ReentrantWaitsEnabled =>
+            CurrentThread.GetApartmentState() == ApartmentState.STA;
 
-        [MethodImpl(MethodImplOptions.InternalCall)]
-        internal extern int SetApartmentStateNative(int state);
 #else // FEATURE_COMINTEROP_APARTMENT_SUPPORT
+        public ApartmentState GetApartmentState() => ApartmentState.Unknown;
+
         private static bool SetApartmentStateUnchecked(ApartmentState state, bool throwOnError)
         {
             if (state != ApartmentState.Unknown)
@@ -308,6 +406,8 @@ namespace System.Threading
 
             return true;
         }
+
+        internal const bool ReentrantWaitsEnabled = false;
 #endif // FEATURE_COMINTEROP_APARTMENT_SUPPORT
 
 #if FEATURE_COMINTEROP
@@ -317,6 +417,7 @@ namespace System.Threading
             GC.KeepAlive(this);
         }
 
+        [SuppressGCTransition]
         [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "ThreadNative_DisableComObjectEagerCleanup")]
         private static partial void DisableComObjectEagerCleanup(ThreadHandle t);
 #else // !FEATURE_COMINTEROP
@@ -330,25 +431,38 @@ namespace System.Threading
         /// </summary>
         public void Interrupt()
         {
+#if TARGET_UNIX || TARGET_BROWSER || TARGET_WASI
+            WaitSubsystem.Interrupt(this);
+#else
             Interrupt(GetNativeHandle());
             GC.KeepAlive(this);
+#endif
         }
 
+#if TARGET_WINDOWS
+        [ErrorHandler(typeof(QCallExceptionStatusMarshaller), ErrorLocation.HiddenLastParameter)]
         [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "ThreadNative_Interrupt")]
         private static partial void Interrupt(ThreadHandle t);
 
-        /// <summary>
-        /// Waits for the thread to die or for timeout milliseconds to elapse.
-        /// </summary>
-        /// <returns>
-        /// Returns true if the thread died, or false if the wait timed out. If
-        /// -1 is given as the parameter, no timeout will occur.
-        /// </returns>
-        /// <exception cref="ArgumentException">if timeout &lt; -1 (Timeout.Infinite)</exception>
-        /// <exception cref="ThreadInterruptedException">if the thread is interrupted while waiting</exception>
-        /// <exception cref="ThreadStateException">if the thread has not been started yet</exception>
-        [MethodImpl(MethodImplOptions.InternalCall)]
-        public extern bool Join(int millisecondsTimeout);
+        [ErrorHandler(typeof(QCallExceptionStatusMarshaller), ErrorLocation.HiddenLastParameter)]
+        [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "ThreadNative_GetOSHandle")]
+        private static partial SafeWaitHandle GetOSHandle(ThreadHandle t);
+
+        private SafeWaitHandle GetJoinHandle()
+        {
+            SafeWaitHandle handle = GetOSHandle(GetNativeHandle());
+            GC.KeepAlive(this);
+            return handle;
+        }
+#else
+        private volatile ManualResetEvent? _joinEvent;
+        private SafeWaitHandle GetJoinHandle()
+        {
+            ManualResetEvent newEvent = new ManualResetEvent(false);
+            ManualResetEvent joinEvent = Interlocked.CompareExchange(ref _joinEvent, newEvent, null) ?? newEvent;
+            return joinEvent.SafeWaitHandle;
+        }
+#endif
 
         /// <summary>
         /// Max value to be passed into <see cref="SpinWait(int)"/> for optimal delaying. This value is normalized to be
@@ -359,6 +473,38 @@ namespace System.Threading
             [MethodImpl(MethodImplOptions.InternalCall)]
             get;
         }
+
+        private static class DirectOnThreadLocalData
+        {
+            // Special Thread Static variable which is always allocated at the address of the Thread variable in the ThreadLocalData of the current thread
+            [ThreadStatic]
+            public static IntPtr pNativeThread;
+        }
+
+        /// <summary>
+        /// Get the ThreadStaticBase used for this threads TLS data. This ends up being a pointer to the pNativeThread field on the ThreadLocalData,
+        /// which is at a well known offset from the start of the ThreadLocalData
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [DebuggerHidden]
+        [DebuggerStepThrough]
+        internal static unsafe StaticsHelpers.ThreadLocalData* GetThreadStaticsBase()
+        {
+#if TARGET_WASM
+            // On wasm, reading &DirectOnThreadLocalData.pNativeThread goes through the general
+            // thread-static-base helper (StaticsHelpers.GetNonGCThreadStaticBase), which itself needs
+            // this base, causing infinite recursion. Read the ThreadLocalData base directly via an
+            // FCall to break the bootstrap cycle.
+            return (StaticsHelpers.ThreadLocalData*)GetThreadStaticsBaseNative();
+#else
+            return (StaticsHelpers.ThreadLocalData*)(((byte*)Unsafe.AsPointer(ref DirectOnThreadLocalData.pNativeThread)) - sizeof(StaticsHelpers.ThreadLocalData));
+#endif
+        }
+
+#if TARGET_WASM
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern unsafe void* GetThreadStaticsBaseNative();
+#endif
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal void ResetFinalizerThread()
@@ -394,6 +540,96 @@ namespace System.Threading
             if (Priority != ThreadPriority.Highest)
             {
                 Priority = ThreadPriority.Highest;
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern bool CatchAtSafePoint();
+
+        [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "ThreadNative_PollGC")]
+        private static partial void PollGCInternal();
+
+        // GC Suspension is done by simply dropping into native code via p/invoke, and we reuse the p/invoke
+        // mechanism for suspension. On all architectures we should have the actual stub used for the check be implemented
+        // as a small assembly stub which checks the global g_TrapReturningThreads flag and tail-call to this helper
+        private static void PollGC()
+        {
+            if (CatchAtSafePoint())
+            {
+                PollGCWorker();
+            }
+
+            [MethodImpl(MethodImplOptions.NoInlining)]
+            static void PollGCWorker() => PollGCInternal();
+        }
+
+#if TARGET_UNIX || TARGET_BROWSER || TARGET_WASI
+        internal WaitSubsystem.ThreadWaitInfo WaitInfo
+        {
+            get
+            {
+                return Volatile.Read(ref _waitInfo) ?? AllocateWaitInfo();
+
+                WaitSubsystem.ThreadWaitInfo AllocateWaitInfo()
+                {
+                    Interlocked.CompareExchange(ref _waitInfo, new WaitSubsystem.ThreadWaitInfo(this), null!);
+                    return _waitInfo;
+                }
+            }
+        }
+#endif
+
+        private void OnThreadExited()
+        {
+            // Consider this managed thread as dead.
+            // The unmanaged thread is still alive, but will die soon, after cleaning up some state.
+            // We set _isDead = true before calling _waitInfo?.OnThreadExiting() and SetJoinHandle()
+            // so that any threads waiting on this thread to end will correctly see that it is stopped
+            // when we set the join handle.
+            _isDead = true;
+#if TARGET_UNIX || TARGET_BROWSER || TARGET_WASI
+            // Inform the wait subsystem that the thread is exiting. For instance, this would abandon any mutexes locked by
+            // the thread.
+            _waitInfo?.OnThreadExiting();
+            SetJoinHandle();
+#endif
+        }
+
+        [UnmanagedCallersOnly]
+        private static unsafe void OnThreadExited(Thread* pThread, Exception* pException)
+        {
+            try
+            {
+                pThread->OnThreadExited();
+            }
+            catch (Exception ex)
+            {
+                *pException = ex;
+            }
+        }
+
+        [ErrorHandler(typeof(QCallExceptionStatusMarshaller), ErrorLocation.HiddenLastParameter)]
+        [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "ThreadNative_ReentrantWaitAny")]
+        internal static unsafe partial int ReentrantWaitAny([MarshalAs(UnmanagedType.Bool)] bool alertable, int timeout, int count, IntPtr* handles);
+
+        [ErrorHandler(typeof(QCallExceptionStatusMarshaller), ErrorLocation.HiddenLastParameter)]
+        [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "ThreadNative_CheckForPendingInterrupt")]
+        internal static partial void CheckForPendingInterrupt();
+
+        private unsafe NativeThread* GetNativeThreadForCurrentThread()
+        {
+            Debug.Assert(this == CurrentThread);
+            return (NativeThread*)_DONT_USE_InternalThread;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct NativeThread
+        {
+            public ThreadState m_State;
+
+            internal enum ThreadState
+            {
+                TS_WaitSleepJoin = 0x02000000, // Thread is waiting, sleeping or joining
             }
         }
     }

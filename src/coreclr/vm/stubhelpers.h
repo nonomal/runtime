@@ -15,27 +15,10 @@
 
 class StubHelpers
 {
-#ifdef VERIFY_HEAP
-    struct ByrefValidationEntry
-    {
-        void       *pByref; // pointer to GC heap
-        MethodDesc *pMD;    // interop MD this byref was passed to
-    };
-
-    static CQuickArray<ByrefValidationEntry> s_ByrefValidationEntries;
-    static SIZE_T                            s_ByrefValidationIndex;
-    static CrstStatic                        s_ByrefValidationLock;
-
-    static void ValidateObjectInternal(Object *pObjUNSAFE, BOOL fValidateNextObj);
-    static MethodDesc *ResolveInteropMethod(Object *pThisUNSAFE, MethodDesc *pMD);
-    static void FormatValidationMessage(MethodDesc *pMD, SString &ssErrorString);
-
 public:
     static void Init();
+#ifdef VERIFY_HEAP
     static void ProcessByrefValidationList();
-#else // VERIFY_HEAP
-public:
-    static void Init() { LIMITED_METHOD_CONTRACT; }
 #endif // VERIFY_HEAP
 
     //-------------------------------------------------------
@@ -43,54 +26,49 @@ public:
     //-------------------------------------------------------
 
 #ifdef FEATURE_COMINTEROP
-    static FCDECL4(IUnknown*,       GetCOMIPFromRCW,                    Object* pSrcUNSAFE, MethodDesc* pMD, void **ppTarget, CLR_BOOL* pfNeedsRelease);
+    FCDECL4(static IUnknown*,       GetCOMIPFromRCW,    Object* pSrcUNSAFE, MethodTable* pInterfaceMT, INT32 comSlot, void **ppTarget);
 #endif // FEATURE_COMINTEROP
 
-    static FCDECL0(void,            SetLastError            );
-    static FCDECL0(void,            ClearLastError          );
-    static FCDECL1(void*,           GetDelegateTarget,      DelegateObject *pThisUNSAFE);
+    FCDECL0(static void,            SetLastError            );
+    FCDECL0(static void,            ClearLastError          );
 
-    static FCDECL2(FC_BOOL_RET,     TryGetStringTrailByte,  StringObject* thisRefUNSAFE, UINT8 *pbData);
-
-    static FCDECL1(Object*,         GetHRExceptionObject,   HRESULT hr);
-
-#ifdef FEATURE_COMINTEROP
-    static FCDECL3(Object*,         GetCOMHRExceptionObject, HRESULT hr, MethodDesc *pMD, Object *unsafe_pThis);
-#endif // FEATURE_COMINTEROP
-
-    static FCDECL1(Object*,         AllocateInternal,       EnregisteredTypeHandle typeHnd);
-    static FCDECL3(void,            MarshalToUnmanagedVaListInternal, va_list va, DWORD cbVaListSize, const VARARGS* pArgIterator);
-    static FCDECL2(void,            MarshalToManagedVaListInternal, va_list va, VARARGS* pArgIterator);
-    static FCDECL0(void*,           GetStubContext);
-    static FCDECL2(void,            LogPinnedArgument, MethodDesc *localDesc, Object *nativeArg);
-    static FCDECL1(DWORD,           CalcVaListSize, VARARGS *varargs);
-    static FCDECL3(void,            ValidateObject, Object *pObjUNSAFE, MethodDesc *pMD, Object *pThisUNSAFE);
-    static FCDECL3(void,            ValidateByref, void *pByref, MethodDesc *pMD, Object *pThisUNSAFE);
-
-#ifdef PROFILING_SUPPORTED
-    //-------------------------------------------------------
-    // Profiler helper
-    //-------------------------------------------------------
-    static FCDECL3(SIZE_T,          ProfilerBeginTransitionCallback,    SIZE_T pSecretParam, Thread* pThread, Object* unsafe_pThis);
-    static FCDECL2(void,            ProfilerEndTransitionCallback,      MethodDesc* pRealMD, Thread* pThread);
-#endif
-
-    static FCDECL2(void,            MulticastDebuggerTraceHelper, Object*, INT32);
-
-    static FCDECL0(void*,           NextCallReturnAddress);
+    FCDECL2(static void,            LogPinnedArgument, MethodDesc *localDesc, Object *nativeArg);
+#ifdef FEATURE_VARARGS
+    FCDECL1(static DWORD,           CalcVaListSize, VARARGS *varargs);
+#endif // FEATURE_VARARGS
 };
 
-extern "C" void* QCALLTYPE StubHelpers_CreateCustomMarshalerHelper(MethodDesc* pMD, mdToken paramToken, TypeHandle hndManagedType);
+extern "C" void QCALLTYPE StubHelpers_CreateCustomMarshaler(MethodDesc* pMD, mdToken paramToken, TypeHandle hndManagedType, QCall::ObjectHandleOnStack retObject, QCallExceptionStatus* qcallError);
 
-#ifdef FEATURE_COMINTEROP
-extern "C" void QCALLTYPE ObjectMarshaler_ConvertToNative(QCall::ObjectHandleOnStack pSrcUNSAFE, VARIANT* pDest);
-extern "C" void QCALLTYPE ObjectMarshaler_ConvertToManaged(VARIANT* pSrc, QCall::ObjectHandleOnStack retObject);
-
-extern "C" IUnknown* QCALLTYPE InterfaceMarshaler_ConvertToNative(QCall::ObjectHandleOnStack pObjUNSAFE, MethodTable* pItfMT, MethodTable* pClsMT, DWORD dwFlags);
-extern "C" void QCALLTYPE InterfaceMarshaler_ConvertToManaged(IUnknown** ppUnk, MethodTable* pItfMT, MethodTable* pClsMT, DWORD dwFlags, QCall::ObjectHandleOnStack retObject);
+#ifdef PROFILING_SUPPORTED
+extern "C" void* QCALLTYPE StubHelpers_ProfilerBeginTransitionCallback(MethodDesc* pTargetMD, QCallExceptionStatus* qcallError);
+extern "C" void QCALLTYPE StubHelpers_ProfilerEndTransitionCallback(MethodDesc* pTargetMD, QCallExceptionStatus* qcallError);
 #endif
 
-extern "C" void QCALLTYPE StubHelpers_SetStringTrailByte(QCall::StringHandleOnStack str, UINT8 bData);
-extern "C" void QCALLTYPE StubHelpers_ThrowInteropParamException(INT resID, INT paramIdx);
+#ifdef FEATURE_COMINTEROP
+extern "C" IUnknown* QCALLTYPE StubHelpers_GetCOMIPFromRCWSlow(QCall::ObjectHandleOnStack pSrc, MethodTable* pInterfaceMT, INT32 comSlot, void** ppTarget, BOOL* pfNeedsRelease, QCallExceptionStatus* qcallError);
 
+extern "C" void QCALLTYPE ObjectMarshaler_ConvertToNative(QCall::ObjectHandleOnStack pSrcUNSAFE, VARIANT* pDest, QCallExceptionStatus* qcallError);
+extern "C" void QCALLTYPE ObjectMarshaler_ConvertToManaged(VARIANT* pSrc, QCall::ObjectHandleOnStack retObject, QCallExceptionStatus* qcallError);
+
+extern "C" IUnknown* QCALLTYPE InterfaceMarshaler_ConvertToNative(QCall::ObjectHandleOnStack pObjUNSAFE, MethodTable* pItfMT, MethodTable* pClsMT, DWORD dwFlags, QCallExceptionStatus* qcallError);
+extern "C" void QCALLTYPE InterfaceMarshaler_ConvertToManaged(IUnknown** ppUnk, MethodTable* pItfMT, MethodTable* pClsMT, DWORD dwFlags, QCall::ObjectHandleOnStack retObject, QCallExceptionStatus* qcallError);
+extern "C" void QCALLTYPE InterfaceMarshaler_GetObjectForComCallableWrapperIUnknown(IUnknown* unk, QCall::ObjectHandleOnStack retObject, QCallExceptionStatus* qcallError);
+extern "C" void QCALLTYPE InterfaceMarshaler_ValidateComVisibilityForIUnknown(IUnknown* unk, QCallExceptionStatus* qcallError);
+#endif
+
+extern "C" void QCALLTYPE StubHelpers_ThrowInteropParamException(INT resID, INT paramIdx, QCallExceptionStatus* qcallError);
+extern "C" void QCALLTYPE StubHelpers_ThrowInteropException(INT exceptionKind, INT resID, QCallExceptionStatus* qcallError);
+
+#ifdef FEATURE_VARARGS
+extern "C" void QCALLTYPE StubHelpers_MarshalToManagedVaList(va_list va, VARARGS* pArgIterator, QCallExceptionStatus* qcallError);
+extern "C" void QCALLTYPE StubHelpers_MarshalToUnmanagedVaList(va_list va, DWORD cbVaListSize, const VARARGS* pArgIterator, QCallExceptionStatus* qcallError);
+#endif // FEATURE_VARARGS
+
+extern "C" void QCALLTYPE StubHelpers_ValidateObject(QCall::ObjectHandleOnStack pObj, MethodDesc *pMD, QCallExceptionStatus* qcallError);
+extern "C" void QCALLTYPE StubHelpers_ValidateByref(void *pByref, MethodDesc *pMD, QCallExceptionStatus* qcallError);
+
+extern "C" void QCALLTYPE StubHelpers_MulticastDebuggerTraceHelper(QCall::ObjectHandleOnStack element, INT32 count, QCallExceptionStatus* qcallError);
+
+extern "C" void QCALLTYPE StubHelpers_CreateLayoutClassMarshalStubs(QCall::TypeHandle th, PCODE* pConvertToUnmanaged, PCODE* pConvertToManaged, PCODE* pFree, QCallExceptionStatus* qcallError);
 #endif  // __STUBHELPERS_h__

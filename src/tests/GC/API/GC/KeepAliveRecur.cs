@@ -4,6 +4,7 @@
 // Tests KeepAlive() in Recursive method
 
 using System;
+using Xunit;
 
 public class Test_KeepAliveRecur
 {
@@ -34,7 +35,9 @@ public class Test_KeepAliveRecur
         GC.KeepAlive(o);    // Keeping object alive 
     }
 
-    public static int Main()
+    [SkipOnCoreClr("This test is not compatible with GC stress.", RuntimeTestModes.AnyGCStress)]
+    [Fact]
+    public static int TestEntryPoint()
     {
         Dummy obj = new Dummy();
 

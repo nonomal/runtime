@@ -4,6 +4,10 @@
     <RequiresProcessIsolation>true</RequiresProcessIsolation>
     <ReferenceXUnitWrapperGenerator>false</ReferenceXUnitWrapperGenerator>
     <NativeAotIncompatible>true</NativeAotIncompatible>
+    <!-- Tracking issue: https://github.com/dotnet/runtime/issues/92129 -->
+    <CLRTestTargetUnsupported Condition="'$(TargetsAppleMobile)' == 'true'">true</CLRTestTargetUnsupported>
+    <!-- https://github.com/dotnet/runtime/issues/123946 -->
+    <CLRTestTargetUnsupported Condition="'$(TargetsWasm)' == 'true'">true</CLRTestTargetUnsupported>
   </PropertyGroup>
   <PropertyGroup>
     <DebugType>PdbOnly</DebugType>

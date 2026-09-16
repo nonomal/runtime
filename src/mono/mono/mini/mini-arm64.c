@@ -1929,10 +1929,13 @@ get_call_info (MonoMemPool *mp, MonoMethodSignature *sig)
 				ainfo->size = size;
 				continue;
 			} else if (klass == swift_error || klass == swift_error_ptr) {
-				if (sig->pinvoke)
+				if (sig->pinvoke) {
 					ainfo->reg = ARMREG_R21;
-				else
+					ainfo->swift_error_in_reg = TRUE;
+				} else {
 					add_param (cinfo, ainfo, sig->params [pindex], FALSE);
+					ainfo->swift_error_in_reg = ainfo->storage == ArgInIReg;
+				}
 				ainfo->storage = ArgSwiftError;
 				continue;
 			}
@@ -2996,7 +2999,7 @@ mono_arch_allocate_vars (MonoCompile *cfg)
 		case ArgSwiftError: {
 			ins->flags |= MONO_INST_VOLATILE;
 			ins->opcode = OP_REGOFFSET;
-			if (ainfo->offset) {
+			if (!ainfo->swift_error_in_reg) {
 				g_assert (cfg->arch.args_reg);
 				ins->inst_basereg = cfg->arch.args_reg;
 				ins->inst_offset = ainfo->offset;
@@ -4203,8 +4206,7 @@ mono_arch_output_basic_block (MonoCompile *cfg, MonoBasicBlock *bb)
 				guint32 val;
 
 				arm_ldrx (code, ARMREG_IP1, info_var->inst_basereg, GTMREG_TO_INT (info_var->inst_offset));
-				/* Add the bp_tramp_offset */
-				val = ((bp_tramp_offset / 4) * sizeof (target_mgreg_t)) + MONO_STRUCT_OFFSET (SeqPointInfo, bp_addrs);
+				val = (bp_tramp_offset * sizeof (target_mgreg_t)) + MONO_STRUCT_OFFSET (SeqPointInfo, bp_addrs);
 				/* Load the info->bp_addrs [bp_tramp_offset], which is either 0 or the address of the bp trampoline */
 				code = emit_ldrx (code, ARMREG_IP1, ARMREG_IP1, val);
 				/* Skip the load if its 0 */
@@ -5058,7 +5060,10 @@ mono_arch_output_basic_block (MonoCompile *cfg, MonoBasicBlock *bb)
 			break;
 			/* Atomic */
 		case OP_MEMORY_BARRIER:
-			arm_dmb (code, ARM_DMB_ISH);
+			if (ins->backend.memory_barrier_kind == MONO_MEMORY_BARRIER_ACQ)
+				arm_dmb (code, ARM_DMB_ISHLD);
+			else
+				arm_dmb (code, ARM_DMB_ISH);
 			break;
 		case OP_ATOMIC_ADD_I4: {
 			guint8 *buf [16];
@@ -5086,6 +5091,30 @@ mono_arch_output_basic_block (MonoCompile *cfg, MonoBasicBlock *bb)
 			arm_movx (code, dreg, ARMREG_IP0);
 			break;
 		}
+		case OP_ATOMIC_EXCHANGE_U1: {
+			guint8 *buf [16];
+
+			buf [0] = code;
+			arm_ldxrb (code, ARMREG_IP0, sreg1);
+			arm_stlxrb (code, ARMREG_IP1, sreg2, sreg1);
+			arm_cbnzw (code, ARMREG_IP1, buf [0]);
+
+			arm_dmb (code, ARM_DMB_ISH);
+			arm_movx (code, dreg, ARMREG_IP0);
+			break;
+		}
+		case OP_ATOMIC_EXCHANGE_U2: {
+			guint8 *buf [16];
+
+			buf [0] = code;
+			arm_ldxrh (code, ARMREG_IP0, sreg1);
+			arm_stlxrh (code, ARMREG_IP1, sreg2, sreg1);
+			arm_cbnzw (code, ARMREG_IP1, buf [0]);
+
+			arm_dmb (code, ARM_DMB_ISH);
+			arm_movx (code, dreg, ARMREG_IP0);
+			break;
+		}
 		case OP_ATOMIC_EXCHANGE_I4: {
 			guint8 *buf [16];
 
@@ -5106,6 +5135,34 @@ mono_arch_output_basic_block (MonoCompile *cfg, MonoBasicBlock *bb)
 			arm_stlxrx (code, ARMREG_IP1, sreg2, sreg1);
 			arm_cbnzw (code, ARMREG_IP1, buf [0]);
 
+			arm_dmb (code, ARM_DMB_ISH);
+			arm_movx (code, dreg, ARMREG_IP0);
+			break;
+		}
+		case OP_ATOMIC_CAS_U1: {
+			guint8 *buf [16];
+			buf [0] = code;
+			arm_ldxrb (code, ARMREG_IP0, sreg1);
+			arm_cmpw (code, ARMREG_IP0, ins->sreg3);
+			buf [1] = code;
+			arm_bcc (code, ARMCOND_NE, 0);
+			arm_stlxrb(code, ARMREG_IP1, sreg2, sreg1);
+			arm_cbnzw (code, ARMREG_IP1, buf [0]);
+			arm_patch_rel (buf [1], code, MONO_R_ARM64_BCC);
+			arm_dmb (code, ARM_DMB_ISH);
+			arm_movx (code, dreg, ARMREG_IP0);
+			break;
+		}
+		case OP_ATOMIC_CAS_U2: {
+			guint8 *buf [16];
+			buf [0] = code;
+			arm_ldxrh (code, ARMREG_IP0, sreg1);
+			arm_cmpw (code, ARMREG_IP0, ins->sreg3);
+			buf [1] = code;
+			arm_bcc (code, ARMCOND_NE, 0);
+			arm_stlxrh(code, ARMREG_IP1, sreg2, sreg1);
+			arm_cbnzw (code, ARMREG_IP1, buf [0]);
+			arm_patch_rel (buf [1], code, MONO_R_ARM64_BCC);
 			arm_dmb (code, ARM_DMB_ISH);
 			arm_movx (code, dreg, ARMREG_IP0);
 			break;
@@ -5978,7 +6035,7 @@ mono_arch_output_basic_block (MonoCompile *cfg, MonoBasicBlock *bb)
 	after_instruction_emit:
 		if ((cfg->opt & MONO_OPT_BRANCH) && ((code - cfg->native_code - offset) > max_len)) {
 			g_warning ("wrong maximal instruction length of instruction " M_PRI_INST " (expected %d, got %d)",
-				   mono_inst_name (ins->opcode), max_len, code - cfg->native_code - offset);
+				   mono_inst_name (ins->opcode), max_len, (int)(code - cfg->native_code - offset));
 			g_assert_not_reached ();
 		
 		}
@@ -6108,7 +6165,7 @@ emit_move_args (MonoCompile *cfg, guint8 *code)
 				break;
 			case ArgSwiftError:
 				if (cfg->method->wrapper_type == MONO_WRAPPER_MANAGED_TO_NATIVE) {
-					if (ainfo->offset == 0) {
+					if (ainfo->swift_error_in_reg) {
 						code = emit_strx (code, ainfo->reg, cfg->arch.swift_error_var->inst_basereg, GTMREG_TO_INT (cfg->arch.swift_error_var->inst_offset));
 					}
 				} else if (cfg->method->wrapper_type == MONO_WRAPPER_NATIVE_TO_MANAGED) {
@@ -6821,9 +6878,7 @@ mono_arch_set_breakpoint (MonoJitInfo *ji, guint8 *ip)
 
 		if (enable_ptrauth)
 			NOT_IMPLEMENTED;
-		g_assert (native_offset % 4 == 0);
-		g_assert (info->bp_addrs [native_offset / 4] == 0);
-		info->bp_addrs [native_offset / 4] = (guint8*)mini_get_breakpoint_trampoline ();
+		info->bp_addrs [native_offset] = (guint8*)mini_get_breakpoint_trampoline ();
 	} else {
 		/* ip points to an ldrx */
 		code += 4;
@@ -6846,8 +6901,7 @@ mono_arch_clear_breakpoint (MonoJitInfo *ji, guint8 *ip)
 		if (enable_ptrauth)
 			NOT_IMPLEMENTED;
 
-		g_assert (native_offset % 4 == 0);
-		info->bp_addrs [native_offset / 4] = NULL;
+		info->bp_addrs [native_offset] = NULL;
 	} else {
 		/* ip points to an ldrx */
 		code += 4;
@@ -6915,7 +6969,7 @@ mono_arch_get_seq_point_info (guint8 *code)
 		ji = mini_jit_info_table_find (code);
 		g_assert (ji);
 
-		info = g_malloc0 (sizeof (SeqPointInfo) + (ji->code_size / 4) * sizeof(guint8*));
+		info = g_malloc0 (sizeof (SeqPointInfo) + ji->code_size * sizeof(guint8*));
 
 		info->ss_tramp_addr = &ss_trampoline;
 
@@ -6935,8 +6989,12 @@ mono_arch_opcode_supported (int opcode)
 	switch (opcode) {
 	case OP_ATOMIC_ADD_I4:
 	case OP_ATOMIC_ADD_I8:
+	case OP_ATOMIC_EXCHANGE_U1:
+	case OP_ATOMIC_EXCHANGE_U2:
 	case OP_ATOMIC_EXCHANGE_I4:
 	case OP_ATOMIC_EXCHANGE_I8:
+	case OP_ATOMIC_CAS_U1:
+	case OP_ATOMIC_CAS_U2:
 	case OP_ATOMIC_CAS_I4:
 	case OP_ATOMIC_CAS_I8:
 	case OP_ATOMIC_LOAD_I1:

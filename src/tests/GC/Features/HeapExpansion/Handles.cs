@@ -9,6 +9,7 @@ using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using TestLibrary;
+using Xunit;
 
 public class Test_Handles
 {
@@ -16,7 +17,9 @@ public class Test_Handles
     public static List<GCHandle> pinnedList = new List<GCHandle>();
     public static int index = -1;
 
-    public static int Main()
+    [SkipOnCoreClr("This test is not compatible with GC stress.", RuntimeTestModes.AnyGCStress)]
+    [Fact]
+    public static void TestEntryPoint()
     {
         TestFramework.LogInformation("First Alloc");
         GCUtil.Alloc(1024 * 1024, 50);
@@ -31,6 +34,5 @@ public class Test_Handles
         GCUtil.FreePins();
 
         TestFramework.LogInformation("Test passed");
-        return 100;
     }
 }

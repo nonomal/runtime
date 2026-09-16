@@ -6,26 +6,19 @@ using System.Runtime.InteropServices;
 
 namespace System.Diagnostics.Tracing
 {
-    // This is part of the NativeRuntimeEventsource, which is the managed version of the Microsoft-Windows-DotNETRuntime provider.
-    // It contains the runtime specific interop to native event sinks.
     internal sealed partial class NativeRuntimeEventSource : EventSource
     {
-#if NATIVEAOT
-        // We don't have these keywords defined from the genRuntimeEventSources.py, so we need to manually define them here.
-        public static partial class Keywords
-        {
-            public const EventKeywords ContentionKeyword = (EventKeywords)0x4000;
-            public const EventKeywords ThreadingKeyword = (EventKeywords)0x10000;
-            public const EventKeywords ThreadTransferKeyword = (EventKeywords)0x80000000;
-            public const EventKeywords WaitHandleKeyword = (EventKeywords)0x40000000000;
-        }
-#endif
-
         [NonEvent]
+#if CORECLR
+        [ErrorHandler(typeof(QCallExceptionStatusMarshaller), ErrorLocation.HiddenLastParameter)]
+#endif
         [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "NativeRuntimeEventSource_LogContentionLockCreated")]
         private static partial void LogContentionLockCreated(nint LockID, nint AssociatedObjectID, ushort ClrInstanceID);
 
         [NonEvent]
+#if CORECLR
+        [ErrorHandler(typeof(QCallExceptionStatusMarshaller), ErrorLocation.HiddenLastParameter)]
+#endif
         [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "NativeRuntimeEventSource_LogContentionStart")]
         private static partial void LogContentionStart(
             ContentionFlagsMap ContentionFlags,
@@ -35,6 +28,9 @@ namespace System.Diagnostics.Tracing
             ulong LockOwnerThreadID);
 
         [NonEvent]
+#if CORECLR
+        [ErrorHandler(typeof(QCallExceptionStatusMarshaller), ErrorLocation.HiddenLastParameter)]
+#endif
         [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "NativeRuntimeEventSource_LogContentionStop")]
         private static partial void LogContentionStop(
             ContentionFlagsMap ContentionFlags,
@@ -42,30 +38,51 @@ namespace System.Diagnostics.Tracing
             double DurationNs);
 
         [NonEvent]
+#if CORECLR
+        [ErrorHandler(typeof(QCallExceptionStatusMarshaller), ErrorLocation.HiddenLastParameter)]
+#endif
         [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "NativeRuntimeEventSource_LogThreadPoolWorkerThreadStart")]
         private static partial void LogThreadPoolWorkerThreadStart(uint ActiveWorkerThreadCount, uint RetiredWorkerThreadCount, ushort ClrInstanceID);
 
         [NonEvent]
+#if CORECLR
+        [ErrorHandler(typeof(QCallExceptionStatusMarshaller), ErrorLocation.HiddenLastParameter)]
+#endif
         [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "NativeRuntimeEventSource_LogThreadPoolWorkerThreadStop")]
         private static partial void LogThreadPoolWorkerThreadStop(uint ActiveWorkerThreadCount, uint RetiredWorkerThreadCount, ushort ClrInstanceID);
 
         [NonEvent]
+#if CORECLR
+        [ErrorHandler(typeof(QCallExceptionStatusMarshaller), ErrorLocation.HiddenLastParameter)]
+#endif
         [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "NativeRuntimeEventSource_LogThreadPoolWorkerThreadWait")]
         private static partial void LogThreadPoolWorkerThreadWait(uint ActiveWorkerThreadCount, uint RetiredWorkerThreadCount, ushort ClrInstanceID);
 
         [NonEvent]
+#if CORECLR
+        [ErrorHandler(typeof(QCallExceptionStatusMarshaller), ErrorLocation.HiddenLastParameter)]
+#endif
         [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "NativeRuntimeEventSource_LogThreadPoolMinMaxThreads")]
         private static partial void LogThreadPoolMinMaxThreads(ushort MinWorkerThreads, ushort MaxWorkerThreads, ushort MinIOCompletionThreads, ushort MaxIOCompletionThreads, ushort ClrInstanceID);
 
         [NonEvent]
+#if CORECLR
+        [ErrorHandler(typeof(QCallExceptionStatusMarshaller), ErrorLocation.HiddenLastParameter)]
+#endif
         [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "NativeRuntimeEventSource_LogThreadPoolWorkerThreadAdjustmentSample")]
         private static partial void LogThreadPoolWorkerThreadAdjustmentSample(double Throughput, ushort ClrInstanceID);
 
         [NonEvent]
+#if CORECLR
+        [ErrorHandler(typeof(QCallExceptionStatusMarshaller), ErrorLocation.HiddenLastParameter)]
+#endif
         [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "NativeRuntimeEventSource_LogThreadPoolWorkerThreadAdjustmentAdjustment")]
         private static partial void LogThreadPoolWorkerThreadAdjustmentAdjustment(double AverageThroughput, uint NewWorkerThreadCount, ThreadAdjustmentReasonMap Reason, ushort ClrInstanceID);
 
         [NonEvent]
+#if CORECLR
+        [ErrorHandler(typeof(QCallExceptionStatusMarshaller), ErrorLocation.HiddenLastParameter)]
+#endif
         [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "NativeRuntimeEventSource_LogThreadPoolWorkerThreadAdjustmentStats")]
         private static partial void LogThreadPoolWorkerThreadAdjustmentStats(
             double Duration,
@@ -81,6 +98,9 @@ namespace System.Diagnostics.Tracing
             ushort ClrInstanceID);
 
         [NonEvent]
+#if CORECLR
+        [ErrorHandler(typeof(QCallExceptionStatusMarshaller), ErrorLocation.HiddenLastParameter)]
+#endif
         [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "NativeRuntimeEventSource_LogThreadPoolIOEnqueue")]
         private static partial void LogThreadPoolIOEnqueue(
             IntPtr NativeOverlapped,
@@ -89,6 +109,9 @@ namespace System.Diagnostics.Tracing
             ushort ClrInstanceID);
 
         [NonEvent]
+#if CORECLR
+        [ErrorHandler(typeof(QCallExceptionStatusMarshaller), ErrorLocation.HiddenLastParameter)]
+#endif
         [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "NativeRuntimeEventSource_LogThreadPoolIODequeue")]
         private static partial void LogThreadPoolIODequeue(
             IntPtr NativeOverlapped,
@@ -96,12 +119,18 @@ namespace System.Diagnostics.Tracing
             ushort ClrInstanceID);
 
         [NonEvent]
+#if CORECLR
+        [ErrorHandler(typeof(QCallExceptionStatusMarshaller), ErrorLocation.HiddenLastParameter)]
+#endif
         [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "NativeRuntimeEventSource_LogThreadPoolWorkingThreadCount")]
         private static partial void LogThreadPoolWorkingThreadCount(
             uint Count,
             ushort ClrInstanceID);
 
         [NonEvent]
+#if CORECLR
+        [ErrorHandler(typeof(QCallExceptionStatusMarshaller), ErrorLocation.HiddenLastParameter)]
+#endif
         [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "NativeRuntimeEventSource_LogThreadPoolIOPack")]
         private static partial void LogThreadPoolIOPack(
             IntPtr NativeOverlapped,
@@ -109,6 +138,9 @@ namespace System.Diagnostics.Tracing
             ushort ClrInstanceID);
 
         [NonEvent]
+#if CORECLR
+        [ErrorHandler(typeof(QCallExceptionStatusMarshaller), ErrorLocation.HiddenLastParameter)]
+#endif
         [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "NativeRuntimeEventSource_LogWaitHandleWaitStart")]
         private static partial void LogWaitHandleWaitStart(
             WaitHandleWaitSourceMap WaitSource,
@@ -116,6 +148,9 @@ namespace System.Diagnostics.Tracing
             ushort ClrInstanceID);
 
         [NonEvent]
+#if CORECLR
+        [ErrorHandler(typeof(QCallExceptionStatusMarshaller), ErrorLocation.HiddenLastParameter)]
+#endif
         [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "NativeRuntimeEventSource_LogWaitHandleWaitStop")]
         private static partial void LogWaitHandleWaitStop(ushort ClrInstanceID);
     }

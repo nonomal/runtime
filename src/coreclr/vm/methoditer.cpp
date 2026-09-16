@@ -18,7 +18,7 @@
 // assembly might be without a reference and get deallocated (even the native part).
 //
 BOOL LoadedMethodDescIterator::Next(
-    CollectibleAssemblyHolder<DomainAssembly *> * pDomainAssemblyHolder)
+    CollectibleAssemblyHolder<Assembly *> * pAssemblyHolder)
 {
     CONTRACTL
     {
@@ -35,7 +35,7 @@ BOOL LoadedMethodDescIterator::Next(
         // If the method + type is not generic, then nothing more to iterate.
         if (!m_mainMD->HasClassOrMethodInstantiation())
         {
-            *pDomainAssemblyHolder = NULL;
+            *pAssemblyHolder = NULL;
             return FALSE;
         }
         goto ADVANCE_METHOD;
@@ -53,31 +53,31 @@ BOOL LoadedMethodDescIterator::Next(
     // at the method table, flags and token etc.
     if (m_mainMD == NULL)
     {
-        *pDomainAssemblyHolder = NULL;
+        *pAssemblyHolder = NULL;
         return FALSE;
     }
 
     // Needs to work w/ non-generic methods too.
     if (!m_mainMD->HasClassOrMethodInstantiation())
     {
-        *pDomainAssemblyHolder = NULL;
+        *pAssemblyHolder = NULL;
         return TRUE;
     }
 
     m_assemIterator = m_pAppDomain->IterateAssembliesEx(m_assemIterationFlags);
 
 ADVANCE_ASSEMBLY:
-    if  (!m_assemIterator.Next(pDomainAssemblyHolder))
+    if  (!m_assemIterator.Next(pAssemblyHolder))
     {
-        _ASSERTE(*pDomainAssemblyHolder == NULL);
+        _ASSERTE(*pAssemblyHolder == NULL);
         return FALSE;
     }
 
 #ifdef _DEBUG
-    dbg_m_pDomainAssembly = *pDomainAssemblyHolder;
+    dbg_m_pAssembly = *pAssemblyHolder;
 #endif //_DEBUG
 
-    m_currentModule = (*pDomainAssemblyHolder)->GetModule();
+    m_currentModule = (*pAssemblyHolder)->GetModule();
 
     if (m_mainMD->HasClassInstantiation())
     {
@@ -136,6 +136,9 @@ ADVANCE_METHOD:
             goto ADVANCE_METHOD;
         if (m_methodIteratorEntry->GetMethod()->GetMemberDef() != m_md)
             goto ADVANCE_METHOD;
+        if (m_filterAsyncVariant &&
+            !m_methodIteratorEntry->GetMethod()->MatchesAsyncVariantLookup(m_asyncVariantLookup))
+            goto ADVANCE_METHOD;
     }
     else if (m_startedNonGenericMethod)
     {
@@ -149,7 +152,7 @@ ADVANCE_METHOD:
     // Note: We don't need to keep the assembly alive in DAC - see code:CollectibleAssemblyHolder#CAH_DAC
 #ifndef DACCESS_COMPILE
     _ASSERTE_MSG(
-        *pDomainAssemblyHolder == dbg_m_pDomainAssembly,
+        *pAssemblyHolder == dbg_m_pAssembly,
         "Caller probably modified the assembly holder, which they shouldn't - see method comment.");
 #endif //DACCESS_COMPILE
 
@@ -194,8 +197,10 @@ MethodDesc *LoadedMethodDescIterator::Current()
     }
 
     MethodTable *pMT = m_typeIteratorEntry->GetTypeHandle().GetMethodTable()->GetCanonicalMethodTable();
-    PREFIX_ASSUME(pMT != NULL);
-    return pMT->GetParallelMethodDesc(m_mainMD);
+    _ASSERTE(pMT != NULL);
+    return m_filterAsyncVariant
+        ? pMT->GetParallelMethodDesc(m_mainMD, m_asyncVariantLookup)
+        : pMT->GetParallelMethodDesc(m_mainMD);
 }
 
 void
@@ -220,6 +225,8 @@ LoadedMethodDescIterator::Start(
     m_md = md;
     m_pAppDomain = pAppDomain;
     m_fFirstTime = TRUE;
+    m_asyncVariantLookup = AsyncVariantLookup::Ordinary;
+    m_filterAsyncVariant = false;
 
     _ASSERTE(pAppDomain != NULL);
     _ASSERTE(TypeFromToken(m_md) == mdtMethodDef);
@@ -238,6 +245,20 @@ LoadedMethodDescIterator::Start(
     m_mainMD = pMethodDesc;
 }
 
+void
+LoadedMethodDescIterator::StartForAsyncVariant(
+    AppDomain     *pAppDomain,
+    Module          *pModule,
+    mdMethodDef     md,
+    MethodDesc      *pMethodDesc,
+    AssemblyIterationFlags assemblyIterationFlags)
+{
+    Start(pAppDomain, pModule, md, assemblyIterationFlags);
+    m_mainMD = pMethodDesc;
+    m_asyncVariantLookup = pMethodDesc->GetMatchingAsyncVariantLookup();
+    m_filterAsyncVariant = true;
+}
+
 LoadedMethodDescIterator::LoadedMethodDescIterator(void)
 {
     LIMITED_METHOD_CONTRACT;
@@ -245,4 +266,6 @@ LoadedMethodDescIterator::LoadedMethodDescIterator(void)
     m_module = NULL;
     m_md = mdTokenNil;
     m_pAppDomain = NULL;
+    m_asyncVariantLookup = AsyncVariantLookup::Ordinary;
+    m_filterAsyncVariant = false;
 }

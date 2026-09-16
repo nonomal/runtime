@@ -5,6 +5,7 @@
 
 using System;
 using System.Collections;
+using Xunit;
 
 public class Test_keepalivefinalize {
 	
@@ -29,7 +30,9 @@ public class Test_keepalivefinalize {
 		}
 	}
 
-	public static int Main() {
+	[SkipOnCoreClr("This test is not compatible with GC stress.", RuntimeTestModes.AnyGCStress)]
+	[Fact]
+	public static int TestEntryPoint() {
 
         int returnValue = 0;
 		Dummy1 obj = new Dummy1();

@@ -2,6 +2,7 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -9,7 +10,7 @@ using System.Threading;
 
 namespace System.Net.Sockets
 {
-    internal sealed unsafe class SocketAsyncEngine : IThreadPoolWorkItem
+    internal sealed unsafe class SocketAsyncEngine
     {
         private const int EventBufferCount =
 #if DEBUG
@@ -24,13 +25,34 @@ namespace System.Net.Sockets
         // PreferInlineCompletions defaults to false and can be set to true using the DOTNET_SYSTEM_NET_SOCKETS_INLINE_COMPLETIONS envvar.
         internal static readonly bool InlineSocketCompletionsEnabled = Environment.GetEnvironmentVariable("DOTNET_SYSTEM_NET_SOCKETS_INLINE_COMPLETIONS") == "1";
 
+        // The events of a batch are packed into balanced binary trees, one work item per tree.
+        // A tree is unpacked by the thread that executes its root, so the events of a large tree can
+        // end up serialized behind that thread unless other threads steal them, which only happens
+        // when they run out of work. Capping the size bounds that delay, at the cost of posting more
+        // work items - which is fine, since it only happens for batches that are large to begin with.
+        // Anything in the 8 - 64 range performs the same, larger values give up the latency benefit.
+        private const int MaxTreeSize = 32;
+
+        // Set when some socket is given a PreferInlineCompletions value that differs from the
+        // process-wide default above. That is done through an experimental API and virtually never
+        // happens, so until it does, the event loop can use the default without reading per-context state.
+        // This is a one-way latch - it is never reset back to false.
+        private static bool s_anyInlineCompletionsOverride;
+
+        internal static void OnInlineCompletionsOverride() => s_anyInlineCompletionsOverride = true;
+
+        private static bool PrefersInlineCompletions(SocketAsyncContext context) =>
+            // InlineSocketCompletionsEnabled is a static readonly bool, so in the common case this
+            // folds into a constant and the context is not touched at all.
+            s_anyInlineCompletionsOverride ? context.PreferInlineCompletions : InlineSocketCompletionsEnabled;
+
         private static int GetEngineCount()
         {
             // The responsibility of SocketAsyncEngine is to get notifications from epoll|kqueue
             // and schedule corresponding work items to ThreadPool (socket reads and writes).
             //
             // Using TechEmpower benchmarks that generate a LOT of SMALL socket reads and writes under a VERY HIGH load
-            // we have observed that a single engine is capable of keeping busy up to thirty x64 and eight ARM64 CPU Cores.
+            // we have observed that a single engine is capable of keeping busy up to thirty x64 and twelve ARM64 CPU Cores.
             //
             // The vast majority of real-life scenarios is never going to generate such a huge load (hundreds of thousands of requests per second)
             // and having a single producer should be almost always enough.
@@ -51,7 +73,7 @@ namespace System.Net.Sockets
 
             Architecture architecture = RuntimeInformation.ProcessArchitecture;
             int coresPerEngine = architecture == Architecture.Arm64 || architecture == Architecture.Arm
-                ? 8
+                ? 12
                 : 30;
 
             return Math.Max(1, (int)Math.Round(Environment.ProcessorCount / (double)coresPerEngine));
@@ -74,36 +96,27 @@ namespace System.Net.Sockets
             return engines;
         }
 
+        /// <summary>
+        /// Each <see cref="SocketAsyncContext"/> is assigned an index into this table while registered with a <see cref="SocketAsyncEngine"/>.
+        /// <para>The index is used as the <see cref="Interop.Sys.SocketEvent.Data"/> to quickly map events to <see cref="SocketAsyncContext"/>s.</para>
+        /// <para>It is also stored in <see cref="SocketAsyncContext.GlobalContextIndex"/> so that we can efficiently remove it when unregistering the socket.</para>
+        /// </summary>
+        private static SocketAsyncContext?[] s_registeredContexts = [];
+        private static readonly Queue<int> s_registeredContextsFreeList = [];
+
         private readonly IntPtr _port;
         private readonly Interop.Sys.SocketEvent* _buffer;
 
         //
-        // Maps handle values to SocketAsyncContext instances.
+        // Pool of reusable SocketIOEvent objects to avoid allocating one per event.
         //
-        private readonly ConcurrentDictionary<IntPtr, SocketAsyncContextWrapper> _handleToContextMap = new ConcurrentDictionary<IntPtr, SocketAsyncContextWrapper>();
+        private readonly ConcurrentQueue<SocketIOEvent> _eventPool = new ConcurrentQueue<SocketIOEvent>();
 
-        //
-        // Queue of events generated by EventLoop() that would be processed by the thread pool
-        //
-        private readonly ConcurrentQueue<SocketIOEvent> _eventQueue = new ConcurrentQueue<SocketIOEvent>();
-
-        // The scheme works as follows:
-        // - From NotScheduled, the only transition is to Scheduled when new events are enqueued and a work item is enqueued to process them.
-        // - From Scheduled, the only transition is to Determining right before trying to dequeue an event.
-        // - From Determining, it can go to either NotScheduled when no events are present in the queue (the previous work item processed all of them)
-        //   or Scheduled if the queue is still not empty (let the current work item handle parallelization as convinient).
-        //
-        // The goal is to avoid enqueueing more work items than necessary, while still ensuring that all events are processed.
-        // Another work item isn't enqueued to the thread pool hastily while the state is Determining,
-        // instead the parallelizer takes care of that. We also ensure that only one thread can be parallelizing at any time.
-        private enum EventQueueProcessingStage
-        {
-            NotScheduled,
-            Determining,
-            Scheduled
-        }
-
-        private EventQueueProcessingStage _eventQueueProcessingStage;
+        // Reusable, preallocated scratch buffer used by the event loop to collect the async events produced by a
+        // single WaitForSocketEvents call before packing them into a balanced binary tree.
+        // The number of async events can never exceed the number of socket events, which is
+        // bounded by EventBufferCount, so this array never needs to grow.
+        private readonly SocketIOEvent[] _asyncEvents = new SocketIOEvent[EventBufferCount];
 
         //
         // Registers the Socket with a SocketAsyncEngine, and returns the associated engine.
@@ -119,28 +132,54 @@ namespace System.Net.Sockets
 
         private bool TryRegisterCore(IntPtr socketHandle, SocketAsyncContext context, out Interop.Error error)
         {
-            bool added = _handleToContextMap.TryAdd(socketHandle, new SocketAsyncContextWrapper(context));
-            if (!added)
+            Debug.Assert(context.GlobalContextIndex == -1);
+
+            lock (s_registeredContextsFreeList)
             {
-                // Using public SafeSocketHandle(IntPtr) a user can add the same handle
-                // from a different Socket instance.
-                throw new InvalidOperationException(SR.net_sockets_handle_already_used);
+                if (!s_registeredContextsFreeList.TryDequeue(out int index))
+                {
+                    int previousLength = s_registeredContexts.Length;
+                    int newLength = Math.Max(4, 2 * previousLength);
+
+                    Array.Resize(ref s_registeredContexts, newLength);
+
+                    for (int i = previousLength + 1; i < newLength; i++)
+                    {
+                        s_registeredContextsFreeList.Enqueue(i);
+                    }
+
+                    index = previousLength;
+                }
+
+                Debug.Assert(s_registeredContexts[index] is null);
+
+                s_registeredContexts[index] = context;
+                context.GlobalContextIndex = index;
             }
 
             error = Interop.Sys.TryChangeSocketEventRegistration(_port, socketHandle, Interop.Sys.SocketEvents.None,
-                Interop.Sys.SocketEvents.Read | Interop.Sys.SocketEvents.Write, socketHandle);
+                Interop.Sys.SocketEvents.Read | Interop.Sys.SocketEvents.Write, context.GlobalContextIndex);
             if (error == Interop.Error.SUCCESS)
             {
                 return true;
             }
 
-            _handleToContextMap.TryRemove(socketHandle, out _);
+            UnregisterSocket(context);
             return false;
         }
 
-        public void UnregisterSocket(IntPtr socketHandle)
+        public static void UnregisterSocket(SocketAsyncContext context)
         {
-            _handleToContextMap.TryRemove(socketHandle, out _);
+            Debug.Assert(context.GlobalContextIndex >= 0);
+            Debug.Assert(ReferenceEquals(s_registeredContexts[context.GlobalContextIndex], context));
+
+            lock (s_registeredContextsFreeList)
+            {
+                s_registeredContexts[context.GlobalContextIndex] = null;
+                s_registeredContextsFreeList.Enqueue(context.GlobalContextIndex);
+            }
+
+            context.GlobalContextIndex = -1;
         }
 
         private SocketAsyncEngine()
@@ -188,11 +227,10 @@ namespace System.Net.Sockets
         {
             try
             {
-                SocketEventHandler handler = new SocketEventHandler(this);
                 while (true)
                 {
                     int numEvents = EventBufferCount;
-                    Interop.Error err = Interop.Sys.WaitForSocketEvents(_port, handler.Buffer, &numEvents);
+                    Interop.Error err = Interop.Sys.WaitForSocketEvents(_port, _buffer, &numEvents);
                     if (err != Interop.Error.SUCCESS)
                     {
                         throw new InternalException(err);
@@ -201,15 +239,7 @@ namespace System.Net.Sockets
                     // The native shim is responsible for ensuring this condition.
                     Debug.Assert(numEvents > 0, $"Unexpected numEvents: {numEvents}");
 
-                    // Only enqueue a work item if the stage is NotScheduled.
-                    // Otherwise there must be a work item already queued or another thread already handling parallelization.
-                    if (handler.HandleSocketEvents(numEvents) &&
-                        Interlocked.Exchange(
-                            ref _eventQueueProcessingStage,
-                            EventQueueProcessingStage.Scheduled) == EventQueueProcessingStage.NotScheduled)
-                    {
-                        ThreadPool.UnsafeQueueUserWorkItem(this, preferLocal: false);
-                    }
+                    HandleAndDispatchSocketEvents(numEvents);
                 }
             }
             catch (Exception e)
@@ -218,89 +248,68 @@ namespace System.Net.Sockets
             }
         }
 
-        private void UpdateEventQueueProcessingStage(bool isEventQueueEmpty)
+        // Handles the socket events currently in the buffer, packing the ones that need to be completed
+        // asynchronously into balanced binary trees and posting each tree to the thread pool queue as one
+        // item. The trees are unpacked into the local queues as the items execute.
+        //
+        // The JIT is allowed to arbitrarily extend the lifetime of locals, which may retain SocketAsyncContext references,
+        // indirectly preventing Socket instances to be finalized, despite being no longer referenced by user code.
+        // To avoid this, the event handling logic is delegated to a non-inlined processing method so that the
+        // SocketAsyncContext references held in its locals do not extend onto the EventLoop frame across the
+        // (potentially long) WaitForSocketEvents wait.
+        // See discussion: https://github.com/dotnet/runtime/issues/37064
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private void HandleAndDispatchSocketEvents(int numEvents)
         {
-            if (!isEventQueueEmpty)
+            SocketIOEvent[] asyncEvents = _asyncEvents;
+            int count = 0;
+
+            foreach (var socketEvent in new ReadOnlySpan<Interop.Sys.SocketEvent>(_buffer, numEvents))
             {
-                // There are more events to process, set stage to Scheduled and enqueue a work item.
-                _eventQueueProcessingStage = EventQueueProcessingStage.Scheduled;
-            }
-            else
-            {
-                // The stage here would be Scheduled if an enqueuer has enqueued work and changed the stage, or Determining
-                // otherwise. If the stage is Determining, there's no more work to do. If the stage is Scheduled, the enqueuer
-                // would not have scheduled a work item to process the work, so schedule one now.
-                EventQueueProcessingStage stageBeforeUpdate =
-                    Interlocked.CompareExchange(
-                        ref _eventQueueProcessingStage,
-                        EventQueueProcessingStage.NotScheduled,
-                        EventQueueProcessingStage.Determining);
-                Debug.Assert(stageBeforeUpdate != EventQueueProcessingStage.NotScheduled);
-                if (stageBeforeUpdate == EventQueueProcessingStage.Determining)
+                Debug.Assert((uint)socketEvent.Data < (uint)s_registeredContexts.Length);
+
+                // The context may be null if the socket was unregistered right before the event was processed.
+                // The slot in s_registeredContexts may have been reused by a different context, in which case the
+                // incorrect socket will notice that no information is available yet and harmlessly retry, waiting for new events.
+                SocketAsyncContext? context = s_registeredContexts[(uint)socketEvent.Data];
+
+                if (context is not null)
                 {
-                    return;
+                    if (PrefersInlineCompletions(context))
+                    {
+                        context.HandleEventsInline(socketEvent.Events);
+                    }
+                    else
+                    {
+                        Interop.Sys.SocketEvents events = context.HandleSyncEventsSpeculatively(socketEvent.Events);
+
+                        if (events != Interop.Sys.SocketEvents.None)
+                        {
+                            SocketIOEvent newEvent = RentEvent();
+                            newEvent.With(context, events);
+                            asyncEvents[count++] = newEvent;
+                        }
+                    }
                 }
             }
 
-            ThreadPool.UnsafeQueueUserWorkItem(this, preferLocal: false);
-        }
-
-        void IThreadPoolWorkItem.Execute()
-        {
-            ConcurrentQueue<SocketIOEvent> eventQueue = _eventQueue;
-            SocketIOEvent ev;
-            while (true)
+            if (count == 0)
             {
-                Debug.Assert(_eventQueueProcessingStage == EventQueueProcessingStage.Scheduled);
-
-                // The change needs to be visible to other threads that may request a worker thread before a work item is attempted
-                // to be dequeued by the current thread. In particular, if an enqueuer queues a work item and does not request a
-                // thread because it sees a Determining or Scheduled stage, and the current thread is the last thread processing
-                // work items, the current thread must either see the work item queued by the enqueuer, or it must see a stage of
-                // Scheduled, and try to dequeue again or request another thread.
-                _eventQueueProcessingStage = EventQueueProcessingStage.Determining;
-                Interlocked.MemoryBarrier();
-
-                if (eventQueue.TryDequeue(out ev))
-                {
-                    break;
-                }
-
-                // The stage here would be Scheduled if an enqueuer has enqueued work and changed the stage, or Determining
-                // otherwise. If the stage is Determining, there's no more work to do. If the stage is Scheduled, the enqueuer
-                // would not have scheduled a work item to process the work, so try to dequeue a work item again.
-                EventQueueProcessingStage stageBeforeUpdate =
-                    Interlocked.CompareExchange(
-                        ref _eventQueueProcessingStage,
-                        EventQueueProcessingStage.NotScheduled,
-                        EventQueueProcessingStage.Determining);
-                Debug.Assert(stageBeforeUpdate != EventQueueProcessingStage.NotScheduled);
-                if (stageBeforeUpdate == EventQueueProcessingStage.Determining)
-                {
-                    return;
-                }
+                return;
             }
 
-            UpdateEventQueueProcessingStage(eventQueue.IsEmpty);
-
-            int startTimeMs = Environment.TickCount;
-            do
+            for (int i = 0; i < count; i += MaxTreeSize)
             {
-                ev.Context.HandleEvents(ev.Events);
+                int treeSize = Math.Min(MaxTreeSize, count - i);
 
-                // If there is a constant stream of new events, and/or if user callbacks take long to process an event, this
-                // work item may run for a long time. If work items of this type are using up all of the thread pool threads,
-                // collectively they may starve other types of work items from running. Before dequeuing and processing another
-                // event, check the elapsed time since the start of the work item and yield the thread after some time has
-                // elapsed to allow the thread pool to run other work items.
-                //
-                // The threshold chosen below was based on trying various thresholds and in trying to keep the latency of
-                // running another work item low when these work items are using up all of the thread pool worker threads. In
-                // such cases, the latency would be something like threshold / proc count. Smaller thresholds were tried and
-                // using Stopwatch instead (like 1 ms, 5 ms, etc.), from quick tests they appeared to have a slightly greater
-                // impact on throughput compared to the threshold chosen below, though it is slight enough that it may not
-                // matter much. Higher thresholds didn't seem to have any noticeable effect.
-            } while (Environment.TickCount - startTimeMs < 15 && eventQueue.TryDequeue(out ev));
+                SocketIOEvent root = asyncEvents[i];
+                LinkChildren(root, new ReadOnlySpan<SocketIOEvent>(asyncEvents, i + 1, treeSize - 1));
+
+                ThreadPool.UnsafeQueueUserWorkItem(root, preferLocal: false);
+            }
+
+            // Clear the references so the scratch buffer doesn't keep contexts alive.
+            Array.Clear(asyncEvents, 0, count);
         }
 
         private void FreeNativeResources()
@@ -315,77 +324,103 @@ namespace System.Net.Sockets
             }
         }
 
-        // The JIT is allowed to arbitrarily extend the lifetime of locals, which may retain SocketAsyncContext references,
-        // indirectly preventing Socket instances to be finalized, despite being no longer referenced by user code.
-        // To avoid this, the event handling logic is delegated to a non-inlined processing method.
-        // See discussion: https://github.com/dotnet/runtime/issues/37064
-        // SocketEventHandler holds an on-stack cache of SocketAsyncEngine members needed by the handler method.
-        private readonly struct SocketEventHandler
+        private SocketIOEvent RentEvent() =>
+            _eventPool.TryDequeue(out SocketIOEvent? existingEvent) ?
+                existingEvent :
+                new SocketIOEvent(_eventPool);
+
+        // Arranges the events in the span into a balanced binary tree hanging off the given root.
+        private static void LinkChildren(SocketIOEvent root, ReadOnlySpan<SocketIOEvent> rest)
         {
-            public Interop.Sys.SocketEvent* Buffer { get; }
+            // Events are handed out with null children, either fresh or cleared when recycled.
+            Debug.Assert(root._left is null && root._right is null);
 
-            private readonly ConcurrentDictionary<IntPtr, SocketAsyncContextWrapper> _handleToContextMap;
-            private readonly ConcurrentQueue<SocketIOEvent> _eventQueue;
-
-            public SocketEventHandler(SocketAsyncEngine engine)
+            switch (rest.Length)
             {
-                Buffer = engine._buffer;
-                _handleToContextMap = engine._handleToContextMap;
-                _eventQueue = engine._eventQueue;
+                case 0:
+                    return;
+
+                case 1:
+                    root._left = rest[0];
+                    return;
+
+                case 2:
+                    root._left = rest[0];
+                    root._right = rest[1];
+                    return;
             }
 
-            [MethodImpl(MethodImplOptions.NoInlining)]
-            public bool HandleSocketEvents(int numEvents)
+            // Give the left side the extra element when the count is odd.
+            int leftCount = (rest.Length + 1) / 2;
+
+            ReadOnlySpan<SocketIOEvent> left = rest.Slice(0, leftCount);
+            ReadOnlySpan<SocketIOEvent> right = rest.Slice(leftCount);
+
+            root._left = left[0];
+            LinkChildren(left[0], left.Slice(1));
+
+            if (!right.IsEmpty)
             {
-                bool enqueuedEvent = false;
-                foreach (var socketEvent in new ReadOnlySpan<Interop.Sys.SocketEvent>(Buffer, numEvents))
+                root._right = right[0];
+                LinkChildren(right[0], right.Slice(1));
+            }
+        }
+
+        private sealed class SocketIOEvent : IThreadPoolWorkItem
+        {
+            private readonly ConcurrentQueue<SocketIOEvent> _pool;
+            public SocketIOEvent? _left;
+            public SocketIOEvent? _right;
+
+            public SocketAsyncContext? _context;
+            public Interop.Sys.SocketEvents _events;
+
+            // Assuming that SocketIOEvent + overhead of a queue slot takes ~ 64bytes,
+            // we will limit the number of events in the pool to 1MB / 64bytes = 16k items
+            // to prevent unlimited growth in edge cases.
+            // The count of events in flight per engine should normally be much less than this.
+            private const int MaxEventPoolCount = 1024 * 1024 / 64;
+
+            public SocketIOEvent(ConcurrentQueue<SocketIOEvent> pool)
+            {
+                _pool = pool;
+            }
+
+            public void With(SocketAsyncContext context, Interop.Sys.SocketEvents events)
+            {
+                _context = context;
+                _events = events;
+            }
+
+            void IThreadPoolWorkItem.Execute()
+            {
+                // Unpack the child subtrees into the local queue. Each of them will in turn
+                // unpack its own children when it executes.
+                SocketIOEvent? left = _left;
+                SocketIOEvent? right = _right;
+
+                if (left is not null)
                 {
-                    if (_handleToContextMap.TryGetValue(socketEvent.Data, out SocketAsyncContextWrapper contextWrapper))
-                    {
-                        SocketAsyncContext context = contextWrapper.Context;
-
-                        if (context.PreferInlineCompletions)
-                        {
-                            context.HandleEventsInline(socketEvent.Events);
-                        }
-                        else
-                        {
-                            Interop.Sys.SocketEvents events = context.HandleSyncEventsSpeculatively(socketEvent.Events);
-
-                            if (events != Interop.Sys.SocketEvents.None)
-                            {
-                                _eventQueue.Enqueue(new SocketIOEvent(context, events));
-                                enqueuedEvent = true;
-                            }
-                        }
-                    }
+                    ThreadPool.UnsafeQueueUserWorkItem(left, preferLocal: true);
+                }
+                if (right is not null)
+                {
+                    ThreadPool.UnsafeQueueUserWorkItem(right, preferLocal: true);
                 }
 
-                return enqueuedEvent;
-            }
-        }
+                SocketAsyncContext context = _context!;
+                Interop.Sys.SocketEvents events = _events;
 
-        // struct wrapper is used in order to improve the performance of the epoll thread hot path by up to 3% of some TechEmpower benchmarks
-        // the goal is to have a dedicated generic instantiation and using:
-        // System.Collections.Concurrent.ConcurrentDictionary`2[System.IntPtr,System.Net.Sockets.SocketAsyncContextWrapper]::TryGetValueInternal(!0,int32,!1&)
-        // instead of:
-        // System.Collections.Concurrent.ConcurrentDictionary`2[System.IntPtr,System.__Canon]::TryGetValueInternal(!0,int32,!1&)
-        private readonly struct SocketAsyncContextWrapper
-        {
-            public SocketAsyncContextWrapper(SocketAsyncContext context) => Context = context;
+                if (_pool.Count < MaxEventPoolCount)
+                {
+                    _context = null;
+                    _events = Interop.Sys.SocketEvents.None;
+                    _left = null;
+                    _right = null;
+                    _pool.Enqueue(this);
+                }
 
-            internal SocketAsyncContext Context { get; }
-        }
-
-        private readonly struct SocketIOEvent
-        {
-            public SocketAsyncContext Context { get; }
-            public Interop.Sys.SocketEvents Events { get; }
-
-            public SocketIOEvent(SocketAsyncContext context, Interop.Sys.SocketEvents events)
-            {
-                Context = context;
-                Events = events;
+                context.HandleEvents(events);
             }
         }
     }

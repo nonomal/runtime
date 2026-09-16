@@ -2,7 +2,9 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System;
+using System.Collections.Generic;
 using System.Collections.Immutable;
+using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Threading;
 using Microsoft.CodeAnalysis;
@@ -10,7 +12,6 @@ using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using InterfaceInfo = (Microsoft.Interop.ComInterfaceInfo InterfaceInfo, Microsoft.CodeAnalysis.INamedTypeSymbol Symbol);
 using DiagnosticOrInterfaceInfo = Microsoft.Interop.DiagnosticOr<(Microsoft.Interop.ComInterfaceInfo InterfaceInfo, Microsoft.CodeAnalysis.INamedTypeSymbol Symbol)>;
-using System.Diagnostics;
 
 namespace Microsoft.Interop
 {
@@ -29,6 +30,12 @@ namespace Microsoft.Interop
         public ComInterfaceOptions Options { get; init; }
         public Location DiagnosticLocation { get; init; }
         public bool IsExternallyDefined { get; init; }
+
+        /// <summary>
+        /// Whether the compilation uses the updated memory safety rules ("unsafe evolution"), which decides
+        /// whether generated types need an <c>unsafe</c> modifier for their pointer members to be legal.
+        /// </summary>
+        public bool UseUpdatedMemorySafetyRules { get; init; }
 
         private ComInterfaceInfo(
             ManagedTypeInfo type,
@@ -94,6 +101,9 @@ namespace Microsoft.Interop
             if (!OptionsAreValid(symbol, syntax, interfaceAttributeData, baseAttributeData, out DiagnosticInfo? optionsDiagnostic))
                 return DiagnosticOrInterfaceInfo.From(optionsDiagnostic);
 
+            if (!ExceptionToUnmanagedMarshallerIsValid(syntax, interfaceAttributeData, out DiagnosticInfo? exceptionToUnmanagedMarshallerDiagnostic))
+                return DiagnosticOrInterfaceInfo.From(exceptionToUnmanagedMarshallerDiagnostic);
+
             InterfaceInfo info = (
                 new ComInterfaceInfo(
                     ManagedTypeInfo.CreateTypeInfoForTypeSymbol(symbol),
@@ -104,7 +114,10 @@ namespace Microsoft.Interop
                     new ContainingSyntax(syntax.Modifiers, syntax.Kind(), syntax.Identifier, syntax.TypeParameterList),
                     guid ?? Guid.Empty,
                     interfaceAttributeData.Options,
-                    syntax.Identifier.GetLocation()),
+                    syntax.Identifier.GetLocation())
+                {
+                    UseUpdatedMemorySafetyRules = env.EnvironmentFlags.HasFlag(EnvironmentFlags.UpdatedMemorySafetyRules)
+                },
                 symbol);
 
             // Now that we've validated all of our requirements, we will check for some non-blocking scenarios
@@ -171,6 +184,13 @@ namespace Microsoft.Interop
             }
 
             return builder.ToImmutable();
+        }
+
+        internal sealed class EqualityComparerForExternalIfaces : IEqualityComparer<(ComInterfaceInfo InterfaceInfo, INamedTypeSymbol Symbol)>
+        {
+            public bool Equals((ComInterfaceInfo, INamedTypeSymbol) x, (ComInterfaceInfo, INamedTypeSymbol) y) => SymbolEqualityComparer.Default.Equals(x.Item2, y.Item2);
+            public int GetHashCode((ComInterfaceInfo, INamedTypeSymbol) obj) => SymbolEqualityComparer.Default.GetHashCode(obj.Item2);
+            public static readonly EqualityComparerForExternalIfaces Instance = new();
         }
 
         private static bool IsInPartialContext(INamedTypeSymbol symbol, InterfaceDeclarationSyntax syntax, [NotNullWhen(false)] out DiagnosticInfo? diagnostic)
@@ -282,6 +302,34 @@ namespace Microsoft.Interop
                 }
             }
             optionsDiagnostic = null;
+            return true;
+        }
+
+        private static bool ExceptionToUnmanagedMarshallerIsValid(
+            InterfaceDeclarationSyntax syntax,
+            GeneratedComInterfaceCompilationData attrSymbolInfo,
+            [NotNullWhen(false)] out DiagnosticInfo? exceptionToUnmanagedMarshallerDiagnostic)
+        {
+            if (attrSymbolInfo.ExceptionToUnmanagedMarshaller is INamedTypeSymbol exceptionToUnmanagedMarshallerType)
+            {
+                if (!exceptionToUnmanagedMarshallerType.IsAccessibleFromFileScopedClass(out var details))
+                {
+                    exceptionToUnmanagedMarshallerDiagnostic = DiagnosticInfo.Create(
+                        GeneratorDiagnostics.ExceptionToUnmanagedMarshallerNotAccessibleByGeneratedCode,
+                        syntax.Identifier.GetLocation(),
+                        exceptionToUnmanagedMarshallerType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat).Replace(TypeNames.GlobalAlias, ""),
+                        details);
+                    return false;
+                }
+            }
+            else if (attrSymbolInfo.ExceptionToUnmanagedMarshaller is not null)
+            {
+                exceptionToUnmanagedMarshallerDiagnostic = DiagnosticInfo.Create(
+                    GeneratorDiagnostics.InvalidExceptionToUnmanagedMarshallerType,
+                    syntax.Identifier.GetLocation());
+                return false;
+            }
+            exceptionToUnmanagedMarshallerDiagnostic = null;
             return true;
         }
 

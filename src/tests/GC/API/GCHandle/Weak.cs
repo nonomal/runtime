@@ -7,6 +7,7 @@
 using System;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using Xunit;
 
 public class Test_Weak
 {
@@ -39,7 +40,9 @@ public class Test_Weak
         }
     }
 
-    public static int Main()
+    [SkipOnCoreClr("This test is sensitive to JIT optimizations.", RuntimeTestModes.AnyJitOptimizationStress)]
+    [Fact]
+    public static int TestEntryPoint()
     {
         CreateObj temp = new CreateObj();
         temp.RunTest();

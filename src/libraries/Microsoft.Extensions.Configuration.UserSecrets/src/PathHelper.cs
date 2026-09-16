@@ -14,15 +14,14 @@ namespace Microsoft.Extensions.Configuration.UserSecrets
         internal const string SecretsFileName = "secrets.json";
 
         /// <summary>
-        /// <para>
         /// Returns the path to the JSON file that stores user secrets.
-        /// </para>
-        /// <para>
-        /// This uses the current user profile to locate the secrets file on disk in a location outside of source control.
-        /// </para>
         /// </summary>
         /// <param name="userSecretsId">The user secret ID.</param>
         /// <returns>The full path to the secret file.</returns>
+        /// <remarks>
+        /// This method uses the current user profile to locate the secrets
+        /// file on disk in a location outside of source control.
+        /// </remarks>
         public static string GetSecretsPathFromSecretsId(string userSecretsId)
         {
             return InternalGetSecretsPathFromSecretsId(userSecretsId, throwIfNoRoot: true);
@@ -60,8 +59,16 @@ namespace Microsoft.Extensions.Configuration.UserSecrets
 
             // For backwards compat, this checks env vars first before using Env.GetFolderPath
             string? appData = Environment.GetEnvironmentVariable("APPDATA");
+            string? home = Environment.GetEnvironmentVariable("HOME");
+#if NET
+            if (OperatingSystem.IsIOS() || OperatingSystem.IsTvOS() || OperatingSystem.IsMacCatalyst())
+            {
+                // The Apple mobile HOME directory is the app container root, which is not writable.
+                home = null;
+            }
+#endif
             string? root = appData                                                                   // On Windows it goes to %APPDATA%\Microsoft\UserSecrets\
-                       ?? Environment.GetEnvironmentVariable("HOME")                             // On Mac/Linux it goes to ~/.microsoft/usersecrets/
+                       ?? home                                                                       // On Mac/Linux it goes to ~/.microsoft/usersecrets/
                        ?? Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData)
                        ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
                        ?? Environment.GetEnvironmentVariable(userSecretsFallbackDir);            // this fallback is an escape hatch if everything else fails

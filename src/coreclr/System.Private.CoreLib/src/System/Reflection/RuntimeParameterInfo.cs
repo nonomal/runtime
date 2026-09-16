@@ -8,7 +8,7 @@ using MdToken = System.Reflection.MetadataToken;
 
 namespace System.Reflection
 {
-    internal sealed unsafe class RuntimeParameterInfo : ParameterInfo
+    internal sealed class RuntimeParameterInfo : ParameterInfo
     {
         #region Static Members
         internal static ParameterInfo[] GetParameters(IRuntimeMethodInfo method, MemberInfo member, Signature sig)
@@ -38,7 +38,7 @@ namespace System.Reflection
             int sigArgCount = sig.Arguments.Length;
             ParameterInfo[] args =
                 fetchReturnParameter ? null! :
-                sigArgCount == 0 ? Array.Empty<ParameterInfo>() :
+                sigArgCount == 0 ? [] :
                 new ParameterInfo[sigArgCount];
 
             int tkMethodDef = RuntimeMethodHandle.GetMethodDef(methodHandle);
@@ -287,7 +287,7 @@ namespace System.Reflection
                 if (IsOptional)
                 {
                     // If the argument is marked as optional then the default value is Missing.Value.
-                    defaultValue = Type.Missing;
+                    defaultValue = Missing.Value;
                 }
                 #endregion
             }
@@ -434,16 +434,12 @@ namespace System.Reflection
 
         public override Type[] GetRequiredCustomModifiers()
         {
-            return m_signature is null ?
-                Type.EmptyTypes :
-                m_signature.GetCustomModifiers(PositionImpl + 1, true);
+            return m_signature is null ? [] : m_signature.GetCustomModifiers(PositionImpl + 1, true);
         }
 
         public override Type[] GetOptionalCustomModifiers()
         {
-            return m_signature is null ?
-                Type.EmptyTypes :
-                m_signature.GetCustomModifiers(PositionImpl + 1, false);
+            return m_signature is null ? [] : m_signature.GetCustomModifiers(PositionImpl + 1, false);
         }
 
         public override Type GetModifiedParameterType() =>
@@ -455,9 +451,9 @@ namespace System.Reflection
         public override object[] GetCustomAttributes(bool inherit)
         {
             if (MdToken.IsNullToken(m_tkParamDef))
-                return Array.Empty<object>();
+                return [];
 
-            return CustomAttribute.GetCustomAttributes(this, (typeof(object) as RuntimeType)!);
+            return RuntimeCustomAttribute.GetCustomAttributes(this, (typeof(object) as RuntimeType)!);
         }
 
         public override object[] GetCustomAttributes(Type attributeType, bool inherit)
@@ -468,9 +464,9 @@ namespace System.Reflection
                 throw new ArgumentException(SR.Arg_MustBeType, nameof(attributeType));
 
             if (MdToken.IsNullToken(m_tkParamDef))
-                return CustomAttribute.CreateAttributeArrayHelper(attributeRuntimeType, 0);
+                return RuntimeCustomAttribute.CreateAttributeArrayHelper(attributeRuntimeType, 0);
 
-            return CustomAttribute.GetCustomAttributes(this, attributeRuntimeType);
+            return RuntimeCustomAttribute.GetCustomAttributes(this, attributeRuntimeType);
         }
 
         public override bool IsDefined(Type attributeType, bool inherit)
@@ -483,11 +479,14 @@ namespace System.Reflection
             if (attributeType.UnderlyingSystemType is not RuntimeType attributeRuntimeType)
                 throw new ArgumentException(SR.Arg_MustBeType, nameof(attributeType));
 
-            return CustomAttribute.IsDefined(this, attributeRuntimeType);
+            return RuntimeCustomAttribute.IsDefined(this, attributeRuntimeType);
         }
 
         public override IList<CustomAttributeData> GetCustomAttributesData()
         {
+            if (MdToken.IsNullToken(m_tkParamDef))
+                return Array.Empty<CustomAttributeData>();
+
             return RuntimeCustomAttributeData.GetCustomAttributesInternal(this);
         }
         #endregion

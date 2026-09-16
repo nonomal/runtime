@@ -4,10 +4,13 @@
 
 using System;
 using System.Diagnostics;
+using Xunit;
 
 public class Test_Collect
 {
-    public static int Main()
+    [SkipOnCoreClr("This test requires exactly one GC at a specific point and does not run correctly under GC stress.", RuntimeTestModes.AnyGCStress)]
+    [Fact]
+    public static int TestEntryPoint()
     {
         Stopwatch sw = Stopwatch.StartNew();
         GC.Collect();

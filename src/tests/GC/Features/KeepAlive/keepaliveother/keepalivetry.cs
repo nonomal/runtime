@@ -4,6 +4,7 @@
 // Tests KeepAlive() in try...catch...finally
 
 using System;
+using Xunit;
 
 public class Test_keepalivetry
 {
@@ -19,7 +20,9 @@ public class Test_keepalivetry
         }
     }
 
-    public static int Main()
+    [SkipOnCoreClr("This test is not compatible with GC stress.", RuntimeTestModes.AnyGCStress)]
+    [Fact]
+    public static int TestEntryPoint()
     {
 
         Dummy[] obj = new Dummy[100];

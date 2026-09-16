@@ -131,6 +131,9 @@ namespace Microsoft.Extensions.Configuration.Binder.SourceGeneration
                             }
                         case DictionarySpec dictionarySpec:
                             {
+                                // Base case to avoid stack overflow for recursive object graphs.
+                                _seenTransitiveTypes.Add(typeRef, true);
+
                                 bool shouldRegister = _typeIndex.CanBindTo(typeRef) &&
                                     TryRegisterTransitiveTypesForMethodGen(dictionarySpec.KeyTypeRef) &&
                                     TryRegisterTransitiveTypesForMethodGen(dictionarySpec.ElementTypeRef) &&
@@ -145,6 +148,19 @@ namespace Microsoft.Extensions.Configuration.Binder.SourceGeneration
                             }
                         case CollectionSpec collectionSpec:
                             {
+                                // Base case to avoid stack overflow for recursive object graphs.
+                                _seenTransitiveTypes.Add(typeRef, true);
+
+                                // Every element of a non-dictionary collection is constructed and then appended,
+                                // so an element type that cannot be instantiated leaves the collection with
+                                // nothing to bind. No BindCore method is generated for it and the element type
+                                // is not reachable through it. The collection itself remains supported as long
+                                // as an (empty) instance can be created for it.
+                                if (!_typeIndex.HasBindableMembers(collectionSpec))
+                                {
+                                    return _typeIndex.CanInstantiate(collectionSpec);
+                                }
+
                                 if (_typeIndex.GetTypeSpec(collectionSpec.ElementTypeRef) is ComplexTypeSpec)
                                 {
                                     _namespaces.Add("System.Linq");
@@ -157,17 +173,34 @@ namespace Microsoft.Extensions.Configuration.Binder.SourceGeneration
                             {
                                 // Base case to avoid stack overflow for recursive object graphs.
                                 // Register all object types for gen; we need to throw runtime exceptions in some cases.
-                                bool shouldRegister = true;
-                                _seenTransitiveTypes.Add(typeRef, shouldRegister);
+                                _seenTransitiveTypes.Add(typeRef, true);
 
                                 // List<string> is used in generated code as a temp holder for formatting
                                 // an error for config properties that don't map to object properties.
                                 _namespaces.Add("System.Collections.Generic");
 
-                                if (_typeIndex.HasBindableMembers(objectSpec))
+                                bool hasBindableMembers = _typeIndex.HasBindableMembers(objectSpec);
+
+                                // A type with a parameterized constructor gets its constructor parameters bound
+                                // in the Initialize method regardless of whether it also has other bindable
+                                // members; that binding capability must be registered even when
+                                // HasBindableMembers is false (e.g. the only member is a ctor parameter backed
+                                // by a non-bindable read-only collection type), otherwise the emitter can end up
+                                // calling an Initialize method that was never generated.
+                                bool needsInitializeMethod = objectSpec is { InstantiationStrategy: ObjectInstantiationStrategy.ParameterizedConstructor, InitExceptionMessage: null };
+
+                                if (hasBindableMembers || needsInitializeMethod)
                                 {
                                     foreach (PropertySpec property in objectSpec.Properties!)
                                     {
+                                        // Skip types reachable only through non-bindable properties, unless the
+                                        // property backs a constructor parameter. Constructor parameters are always
+                                        // bound in the Initialize method, so their types must still be registered.
+                                        if (!_typeIndex.ShouldBindTo(property) && property.MatchingCtorParam is null)
+                                        {
+                                            continue;
+                                        }
+
                                         TryRegisterTransitiveTypesForMethodGen(property.TypeRef);
 
                                         if (_typeIndex.GetTypeSpec(property.TypeRef) is ComplexTypeSpec)
@@ -176,10 +209,13 @@ namespace Microsoft.Extensions.Configuration.Binder.SourceGeneration
                                         }
                                     }
 
-                                    bool registeredForBindCore = TryRegisterTypeForBindCoreGen(objectSpec);
-                                    Debug.Assert(registeredForBindCore);
+                                    if (hasBindableMembers)
+                                    {
+                                        bool registeredForBindCore = TryRegisterTypeForBindCoreGen(objectSpec);
+                                        Debug.Assert(registeredForBindCore);
+                                    }
 
-                                    if (objectSpec is { InstantiationStrategy: ObjectInstantiationStrategy.ParameterizedConstructor, InitExceptionMessage: null })
+                                    if (needsInitializeMethod)
                                     {
                                         RegisterTypeForMethodGen(MethodsToGen_CoreBindingHelper.Initialize, objectSpec);
                                     }

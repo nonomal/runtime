@@ -45,7 +45,6 @@
 
 class TypeHandleList;
 class Module;
-class BaseDomain;
 class SigTypeContext;
 class SigBuilder;
 
@@ -59,6 +58,9 @@ enum DictionaryEntryKind
     DispatchStubAddrSlot = 5,
     FieldDescSlot = 6,
     DeclaringTypeHandleSlot = 7,
+    // Only used by ReadyToRun signatures (READYTORUN_FIXUP_DeclaringTypeHandle). The signature encodes a
+    // method and the slot is populated with the type which declares that method.
+    DeclaringTypeHandleFromMethodSlot = 8,
 };
 
 enum DictionaryEntrySignatureSource : BYTE
@@ -71,9 +73,6 @@ enum DictionaryEntrySignatureSource : BYTE
 class DictionaryEntryLayout
 {
 public:
-    DictionaryEntryLayout(PTR_VOID signature)
-    { LIMITED_METHOD_CONTRACT; m_signature = signature; }
-
     DictionaryEntryKind GetKind();
 
     PTR_VOID m_signature;
@@ -182,7 +181,7 @@ public:
 class Dictionary
 {
 private:
-    // First N entries are generic instantiations arguments. 
+    // First N entries are generic instantiations arguments.
     // The rest of the open array are normal pointers (no optional indirection) and may be NULL.
     DictionaryEntry m_pEntries[1];
 
@@ -280,7 +279,6 @@ public:
     static DictionaryEntry PopulateEntry(MethodDesc * pMD,
                                          MethodTable * pMT,
                                          LPVOID signature,
-                                         BOOL nonExpansive,
                                          DictionaryEntry ** ppSlot,
                                          DWORD dictionaryIndexAndSlot = -1,
                                          Module * pModule = NULL);

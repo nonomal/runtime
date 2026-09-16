@@ -30,9 +30,9 @@ namespace System.Diagnostics
 
         private void BuildStackFrame(int skipFrames, bool needFileInfo)
         {
-            StackFrameHelper StackF = new StackFrameHelper(null);
+            StackFrameHelper StackF = new StackFrameHelper();
 
-            StackF.InitializeSourceInfo(0, needFileInfo, null);
+            StackF.InitializeSourceInfo(needFileInfo, null);
 
             int iNumOfFrames = StackF.GetNumberOfFrames();
 
@@ -56,6 +56,7 @@ namespace System.Diagnostics
         private static bool AppendStackFrameWithoutMethodBase(StringBuilder sb) => false;
 #pragma warning restore IDE0060
 
+        [ErrorHandler(typeof(QCallExceptionStatusMarshaller), ErrorLocation.HiddenLastParameter)]
         [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "StackFrame_GetMethodDescFromNativeIP")]
         private static partial RuntimeMethodHandleInternal GetMethodDescFromNativeIP(IntPtr ip);
 

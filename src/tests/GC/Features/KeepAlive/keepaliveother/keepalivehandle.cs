@@ -5,6 +5,7 @@
 
 using System;
 using System.Runtime.InteropServices;
+using Xunit;
 
 public class Test_keepalivehandle {
 	public class Dummy {
@@ -16,7 +17,9 @@ public class Test_keepalivehandle {
 		}
 	}
 
-	public static int Main() {
+	[SkipOnCoreClr("This test is not compatible with GC stress.", RuntimeTestModes.AnyGCStress)]
+	[Fact]
+	public static int TestEntryPoint() {
 
         int returnValue = 0;
 		Dummy obj = new Dummy();

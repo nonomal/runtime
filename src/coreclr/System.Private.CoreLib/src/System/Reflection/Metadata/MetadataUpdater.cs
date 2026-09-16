@@ -2,6 +2,7 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
@@ -9,9 +10,11 @@ namespace System.Reflection.Metadata
 {
     public static partial class MetadataUpdater
     {
+        [ErrorHandler(typeof(QCallExceptionStatusMarshaller), ErrorLocation.HiddenLastParameter)]
         [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "AssemblyNative_ApplyUpdate")]
         private static unsafe partial void ApplyUpdate(QCallAssembly assembly, byte* metadataDelta, int metadataDeltaLength, byte* ilDelta, int ilDeltaLength, byte* pdbDelta, int pdbDeltaLength);
 
+        [ErrorHandler(typeof(QCallExceptionStatusMarshaller), ErrorLocation.HiddenLastParameter)]
         [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "AssemblyNative_IsApplyUpdateSupported")]
         [return: MarshalAs(UnmanagedType.Bool)]
         private static unsafe partial bool IsApplyUpdateSupported();
@@ -54,11 +57,12 @@ namespace System.Reflection.Metadata
         /// <summary>
         /// Returns the metadata update capabilities.
         /// </summary>
-        internal static string GetCapabilities() => "Baseline AddMethodToExistingType AddStaticFieldToExistingType AddInstanceFieldToExistingType NewTypeDefinition ChangeCustomAttributes UpdateParameters GenericUpdateMethod GenericAddMethodToExistingType GenericAddFieldToExistingType";
+        internal static string GetCapabilities() => "Baseline AddMethodToExistingType AddStaticFieldToExistingType AddInstanceFieldToExistingType NewTypeDefinition ChangeCustomAttributes UpdateParameters GenericUpdateMethod GenericAddMethodToExistingType GenericAddFieldToExistingType AddFieldRva";
 
         /// <summary>
         /// Returns true if the apply assembly update is enabled and available.
         /// </summary>
+        [FeatureSwitchDefinition("System.Reflection.Metadata.MetadataUpdater.IsSupported")]
         public static bool IsSupported { get; } = IsApplyUpdateSupported();
     }
 }
